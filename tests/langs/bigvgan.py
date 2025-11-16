@@ -55,7 +55,8 @@ def _load_and_cut_audio(audio_path,max_audio_length_seconds,verbose=False,sr=Non
 
 
 # infer
-input_wav_path = r"assets\audio\vo_BZLQ001_6_hutao_07.wav"
+# input_wav_path = r"assets\audio\vo_BZLQ001_6_hutao_07.wav"
+input_wav_path = r"assets\audio\vo_klee_friendship_02.wav"
 output_path = rf"outputs\{Path(input_wav_path).stem}_bigvgan_out.wav"
 
 with torch.no_grad():
