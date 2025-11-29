@@ -2,6 +2,7 @@
 import os
 import traceback
 import re
+import unicodedata
 from typing import List, Union, overload
 import warnings
 from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
@@ -9,9 +10,14 @@ from sentencepiece import SentencePieceProcessor
 
 
 class TextNormalizer:
-    def __init__(self):
+    _HIRAGANA_PATTERN = re.compile(r"[\u3040-\u309f]")
+    _KATAKANA_PATTERN = re.compile(r"[\u30a0-\u30ff\u31f0-\u31ff\uFF66-\uFF9F]")
+    _JAPANESE_PUNCT = re.compile(r"[ー〜〝〞〟・]")
+
+    def __init__(self, preferred_language: str | None = None):
         self.zh_normalizer = None
         self.en_normalizer = None
+        self.preferred_language = preferred_language.lower() if preferred_language else None
         self.char_rep_map = {
             "：": ",",
             "；": ",",
@@ -53,6 +59,14 @@ class TextNormalizer:
             "$": ".",
             **self.char_rep_map,
         }
+        self.jp_char_rep_map = {
+            "『": "'",
+            "』": "'",
+            **self.char_rep_map,
+        }
+        self._base_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
+        self._zh_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.zh_char_rep_map.keys()))
+        self._jp_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.jp_char_rep_map.keys()))
 
     def match_email(self, email):
         # 正则表达式匹配邮箱格式：数字英文@数字英文.英文
@@ -110,36 +124,83 @@ class TextNormalizer:
             )
             self.en_normalizer = NormalizerEn(overwrite_cache=False)
 
-    def normalize(self, text: str) -> str:
-        if not self.zh_normalizer or not self.en_normalizer:
-            print("Error, text normalizer is not initialized !!!")
+    def _ensure_normalizers(self) -> None:
+        if self.zh_normalizer is None or self.en_normalizer is None:
+            self.load()
+
+    def _basic_cleanup(self, text: str) -> str:
+        if not text:
             return ""
-        if self.use_chinese(text):
+        text = unicodedata.normalize("NFKC", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return ""
+        return self._base_cleanup_pattern.sub(lambda x: self.char_rep_map[x.group()], text)
+
+    def is_japanese(self, text: str) -> bool:
+        if self._HIRAGANA_PATTERN.search(text) or self._KATAKANA_PATTERN.search(text):
+            return True
+        if self._JAPANESE_PUNCT.search(text):
+            return True
+        # iteration marks and katakana-hiragana prolonged sound mark
+        if any(ch in text for ch in ("々", "〆", "ゝ", "ゞ", "ゝ", "ゞ", "ー")):
+            return True
+        return False
+
+    def normalize_japanese(self, text: str) -> str:
+        text = text.strip()
+        if not text:
+            return ""
+        text = re.sub(r"^\s*(?:speaker|spk)\s*\d+\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+        text = unicodedata.normalize("NFKC", text)
+        text = re.sub(r"\s+", " ", text)
+        text = self._jp_cleanup_pattern.sub(lambda x: self.jp_char_rep_map[x.group()], text)
+        return text.strip()
+
+    def normalize(self, text: str, language: str | None = None) -> str:
+        if text is None:
+            return ""
+        lang = language.strip().lower() if language else self.preferred_language
+        if lang is None:
+            if self.is_japanese(text):
+                lang = "ja"
+            elif self.use_chinese(text):
+                lang = "zh"
+            else:
+                lang = "en"
+
+        if lang == "ja":
+            self._ensure_normalizers()
+            text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
+            return self.normalize_japanese(text)
+
+        if lang == "zh":
+            self._ensure_normalizers()
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             replaced_text, pinyin_list = self.save_pinyin_tones(text.rstrip())
-            
             replaced_text, original_name_list = self.save_names(replaced_text)
             try:
                 result = self.zh_normalizer.normalize(replaced_text)
             except Exception:
-                result = ""
+                result = replaced_text
                 print(traceback.format_exc())
-            # 恢复人名
             result = self.restore_names(result, original_name_list)
-            # 恢复拼音声调
             result = self.restore_pinyin_tones(result, pinyin_list)
-            pattern = re.compile("|".join(re.escape(p) for p in self.zh_char_rep_map.keys()))
-            result = pattern.sub(lambda x: self.zh_char_rep_map[x.group()], result)
-        else:
+            result = self._zh_cleanup_pattern.sub(lambda x: self.zh_char_rep_map[x.group()], result)
+            return result
+
+        if lang == "en":
+            self._ensure_normalizers()
+            text_processed = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             try:
-                text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
-                result = self.en_normalizer.normalize(text)
+                result = self.en_normalizer.normalize(text_processed)
             except Exception:
-                result = text
                 print(traceback.format_exc())
-            pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
-            result = pattern.sub(lambda x: self.char_rep_map[x.group()], result)
-        return result
+                return self._basic_cleanup(text_processed)
+            result = self._base_cleanup_pattern.sub(lambda x: self.char_rep_map[x.group()], result)
+            return result
+
+        return self._basic_cleanup(text)
 
     def correct_pinyin(self, pinyin: str):
         """
@@ -310,26 +371,26 @@ class TextTokenizer:
             tokens = [tokens]
         return [self.sp_model.PieceToId(token) for token in tokens]
 
-    def tokenize(self, text: str) -> List[str]:
-        return self.encode(text, out_type=str)
+    def tokenize(self, text: str, language: str | None = None) -> List[str]:
+        return self.encode(text, out_type=str, language=language)
 
-    def encode(self, text: str, **kwargs):
+    def encode(self, text: str, language: str | None = None, **kwargs):
         if len(text) == 0:
             return []
         if len(text.strip()) == 1:
             return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
         # 预处理
         if self.normalizer:
-            text = self.normalizer.normalize(text)
+            text = self.normalizer.normalize(text, language=language)
         if len(self.pre_tokenizers) > 0:
             for pre_tokenizer in self.pre_tokenizers:
                 text = pre_tokenizer(text)
         return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
 
-    def batch_encode(self, texts: List[str], **kwargs):
+    def batch_encode(self, texts: List[str], language: str | None = None, **kwargs):
         # 预处理
         if self.normalizer:
-            texts = [self.normalizer.normalize(text) for text in texts]
+            texts = [self.normalizer.normalize(text, language=language) for text in texts]
         if len(self.pre_tokenizers) > 0:
             for pre_tokenizer in self.pre_tokenizers:
                 texts = [pre_tokenizer(text) for text in texts]
