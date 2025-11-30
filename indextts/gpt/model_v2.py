@@ -535,9 +535,10 @@ class UnifiedVoice(nn.Module):
         if return_latent:
             return enc[:, :first_inputs.shape[1]], enc[:, -second_inputs.shape[1]:]
 
-        first_logits = enc[:, :first_inputs.shape[1]]
-        first_logits = first_head(first_logits)
-        first_logits = first_logits.permute(0, 2, 1)
+        first_logits = None  # 不需要计算 text_head
+        # first_logits = enc[:, :first_inputs.shape[1]]
+        # first_logits = first_head(first_logits)
+        # first_logits = first_logits.permute(0, 2, 1)
         if second_inputs is not None:
             second_logits = enc[:, -second_inputs.shape[1]:]
             second_logits = second_head(second_logits)
@@ -576,6 +577,15 @@ class UnifiedVoice(nn.Module):
             conds = conds.mean(dim=1)
             conds = conds.unsqueeze(1)
         return conds
+
+    def get_duration_embeddings(self, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Reuse the learned mel positional embeddings so that duration embeddings share the
+        exact same weight matrix as semantic positions, matching the paper's constraint.
+        """
+        max_index = self.mel_pos_embedding.emb.num_embeddings - 1
+        clamped = lengths.clamp(max=max_index).long()
+        return self.mel_pos_embedding.emb(clamped)
 
 
     def get_emo_conditioning(self, speech_conditioning_input, cond_mel_lengths=None):

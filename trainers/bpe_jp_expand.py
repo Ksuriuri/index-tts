@@ -106,6 +106,6 @@ def extend_model(input_model_path, output_model_path):
 if __name__ == "__main__":
     # 确保当前目录下有 bpe.model
     extend_model(
-        r"checkpoints\IndexTTS-2-vLLM\bpe.model",
-        r"checkpoints\IndexTTS-2-vLLM\jp_bpe.model"
+        r"checkpoints/IndexTTS-2-vLLM/bpe.model",
+        r"checkpoints/IndexTTS-2-vLLM/jp_bpe.model"
     )

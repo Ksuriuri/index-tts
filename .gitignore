@@ -33,3 +33,7 @@ desktop.ini
 assets/audio/
 
 temp.py
+
+trained_ckpts/
+train_data/
+wandb/
