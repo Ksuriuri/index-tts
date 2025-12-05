@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import pickle
 import random
@@ -378,7 +379,13 @@ def main() -> None:
         weight_decay=args.weight_decay
     )
     
-    total_steps = args.max_steps if args.max_steps > 0 else args.epochs * len(train_loader) // max(1, args.grad_accumulation)
+    # total_steps = args.max_steps if args.max_steps > 0 else args.epochs * len(train_loader) // max(1, args.grad_accumulation)
+    num_batches_per_epoch = len(train_loader) // accelerator.num_processes
+    num_update_steps_per_epoch = math.ceil(num_batches_per_epoch / args.grad_accumulation)
+    total_steps = args.epochs * num_update_steps_per_epoch
+
+    if accelerator.is_main_process:
+        print(f"Total training steps: {total_steps} (Steps per epoch: {num_update_steps_per_epoch})")
     
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,

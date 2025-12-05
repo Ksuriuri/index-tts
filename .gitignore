@@ -37,3 +37,4 @@ temp.py
 trained_ckpts/
 train_data/
 wandb/
+outputs/
