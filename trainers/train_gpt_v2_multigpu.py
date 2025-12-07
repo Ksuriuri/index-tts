@@ -94,7 +94,7 @@ class JapaneseGPTDataset(Dataset):
         sample = self.samples[idx]
         return {
             "text_ids": sample.text_ids.long(),
-            "codes": sample.codes.squeeze(0).long(),
+            "codes": sample.codes.long(),
             "condition": sample.condition,
             "emo_vec": sample.emo_vec,
             "text_len": torch.tensor(sample.text_len, dtype=torch.long),
@@ -110,8 +110,8 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
 
     text_padded = pad_sequence(text_tensors, batch_first=True, padding_value=0)
     code_padded = pad_sequence(code_tensors, batch_first=True, padding_value=0)
-    condition_stacked = torch.cat(condition_tensors, dim=0)
-    emo_stacked = torch.cat(emo_tensors, dim=0)
+    condition_stacked = torch.stack(condition_tensors, dim=0)
+    emo_stacked = torch.stack(emo_tensors, dim=0)
 
     text_lengths = torch.stack([item["text_len"] for item in batch])
     code_lengths = torch.stack([item["code_len"] for item in batch])

@@ -3,7 +3,7 @@ import random
 import sys
 import pickle
 import glob
-from tqdm import tqdm  # 用于显示进度条
+from tqdm import tqdm
 
 # 原始路径设置
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,7 +20,7 @@ import safetensors
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
-from trainers.train_gpt_v2 import Sample
+from trainers.utils import ProcessedData
 
 # ******************* 配置路径 *********************
 DATASET_ROOT = "/home/tanhe/hhy/datasets/raw_data/WutheringWaves_Dataset/jp"
@@ -173,7 +173,7 @@ def process_all_files():
 
                 # 8. Create Sample Object
                 # 注意：所有tensor都转回CPU，否则显存会爆炸，且pickle保存时不需要在GPU上
-                sample = Sample(
+                sample = ProcessedData(
                     text_ids=text_ids.to(device="cpu", dtype=torch.int32),
                     codes=semantic_code.to(device="cpu", dtype=torch.int32),
                     text_len=text_len,

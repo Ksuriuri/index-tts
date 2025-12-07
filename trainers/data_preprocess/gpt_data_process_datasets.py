@@ -21,7 +21,6 @@ import safetensors
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
-# from trainers.train_gpt_v2 import Sample # 不再需要 Sample 类
 
 # ******************* 配置路径 *********************
 DATASET_ROOT = "/home/tanhe/hhy/datasets/raw_data/WutheringWaves_Dataset/jp"

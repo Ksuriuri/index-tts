@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from trainers.utils import ProcessedData
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,19 +75,9 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
-@dataclass
-class Sample:
-    text_ids: torch.Tensor  # torch.int32, [text_len]
-    codes: torch.Tensor  # torch.int32, [code_len]
-    text_len: int
-    code_len: int
-    condition: torch.Tensor  # torch.float32, [32, dim]
-    emo_vec: torch.Tensor  # torch.float32, [1, dim]
-
-
 class JapaneseGPTDataset(Dataset):
     def __init__(self, data_path: str):
-        self.samples: List[Sample] = []
+        self.samples: List[ProcessedData] = []
         
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Pickle file not found at: {data_path}")
