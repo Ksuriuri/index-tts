@@ -123,12 +123,18 @@ class DataPreprocessor(Process):
             if input_data is None:
                 break
 
-            processed_datas = []
+            processed_datas_req = []
             try:
+                texts, audios = [], []
                 for input_data_ in input_data:
-                    processed_data = self.preprocess(input_data_.text, input_data_.audio)
-                    processed_datas.append((input_data_.file_rel_path, processed_data))
-                self.output_queue.put(processed_datas)
+                    # processed_data = self.preprocess(input_data_.text, input_data_.audio)
+                    # processed_datas_req.append((input_data_.file_rel_path, processed_data))
+                    texts.append(input_data_.text)
+                    audios.append(input_data_.audio)
+                processed_datas = self.preprocess_batch(texts, audios)
+                for i, processed_data in enumerate(processed_datas):
+                    processed_datas_req.append((input_data[i].file_rel_path, processed_data))
+                self.output_queue.put(processed_datas_req)
             except Exception as e:
                 logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] preprocess error: {traceback.format_exc()}')
                 if self.healthy_check():
@@ -163,7 +169,7 @@ class DataPreprocessor(Process):
         if len(text_ids) == 0:
             raise ValueError("text_ids is empty")
             
-        text_ids = torch.tensor(text_ids, dtype=torch.int32)  # [text_len]
+        text_ids = torch.tensor(text_ids, dtype=torch.int16)  # [text_len]
         text_len = len(text_ids)
 
         # Extract Features
@@ -197,12 +203,92 @@ class DataPreprocessor(Process):
 
         # Create Object
         processed_data = ProcessedData(
-            text_ids=text_ids.to(device="cpu", dtype=torch.int32),
-            codes=semantic_code.to(device="cpu", dtype=torch.int32),
+            text_ids=text_ids.to(device="cpu", dtype=torch.int16),
+            codes=semantic_code.to(device="cpu", dtype=torch.int16),
             text_len=text_len,
             code_len=code_len,
-            condition=conditioning.to(device="cpu", dtype=torch.float32),
-            emo_vec=emo_vec.to(device="cpu", dtype=torch.float32),
+            condition=conditioning.to(device="cpu", dtype=torch.float16),
+            emo_vec=emo_vec.to(device="cpu", dtype=torch.float16),
             duration=duration,
         )
         return processed_data
+
+    @torch.no_grad()
+    def preprocess_batch(
+        self,
+        texts: List[str],
+        audios: List[torch.Tensor],
+    ):
+        """
+        audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
+        """
+        batch_size = len(texts)
+        durations = [audio.shape[0] / 16000 for audio in audios]
+
+        # Tokenize Text
+        text_ids_list = []
+        text_lens = []
+        for text in texts:
+            text_tokens_list = self.tokenizer.tokenize(text)
+            text_ids = self.tokenizer.convert_tokens_to_ids(text_tokens_list)
+        
+            # if len(text_ids) == 0:
+            #     raise ValueError("text_ids is empty")
+            
+            text_ids = torch.tensor(text_ids, dtype=torch.int16)  # [text_len]
+            text_len = len(text_ids)
+
+            text_ids_list.append(text_ids)
+            text_lens.append(text_len)
+
+        # Extract Features
+        # stt = time.time()
+        inputs = self.extract_features(audios, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        # logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] extract_features time: {time.time() - stt:.2f}s')
+        
+        # Get Speaker Condition Embedding
+        # stt = time.time()
+        spk_cond_emb = self.get_emb(input_features, attention_mask)
+        # logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] get_emb time: {time.time() - stt:.2f}s')
+
+        # Quantize / Codec
+        # stt = time.time()
+        cond_lengths = attention_mask.sum(dim=1).long()
+        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb)  # [b, code_len]
+
+        semantic_codes = []
+        code_lens = []
+        for b in range(batch_size):
+            semantic_code_ = semantic_code[b, :cond_lengths[b]]
+            semantic_codes.append(semantic_code_)
+            code_lens.append(semantic_code_.shape[0])
+        # logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] quantize time: {time.time() - stt:.2f}s')
+
+        # Get Conditioning & Emotion Vector
+        # stt = time.time()
+        feat_t = spk_cond_emb.transpose(1, 2)
+        cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
+        
+        conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device)  # [b, 32, 1280]
+        emo_vec = self.gpt.get_emovec(spk_cond_emb, cond_lengths_device)  # [b, 1280]
+        # logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] get_conditioning & get_emovec time: {time.time() - stt:.2f}s')
+
+        conditioning = conditioning.to(device="cpu", dtype=torch.float16)
+        emo_vec = emo_vec.to(device="cpu", dtype=torch.float16)
+
+        # Create Object
+        processed_datas = []
+        for b in range(batch_size):
+            processed_data = ProcessedData(
+                text_ids=text_ids_list[b],
+                codes=semantic_codes[b].to(device="cpu", dtype=torch.int16),
+                text_len=text_lens[b],
+                code_len=code_lens[b],
+                condition=conditioning[b].clone(),
+                emo_vec=emo_vec[b].clone(),
+                duration=durations[b],
+            )
+            processed_datas.append(processed_data)
+        return processed_datas

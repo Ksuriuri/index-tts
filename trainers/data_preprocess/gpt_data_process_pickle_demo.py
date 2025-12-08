@@ -90,7 +90,7 @@ text = "弱い順に、水風級巨浪級怒涛級津波級……そして、規
 # audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 # print(f"load audio time: {time.time() - stt}")
 
-batch_size = 16
+batch_size = 4
 random.seed(42)
 torch.manual_seed(42)
 
@@ -104,41 +104,16 @@ text_len = len(text_ids)
 
 with torch.no_grad():
 
-    # stt_total = time.time()
-    # for audio_16k in audio_16ks:
-    #     stt = time.time()
-    #     # for _ in range(1000):
-    #     inputs = extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-    #     print(f"extract features time: {time.time() - stt}")
-
-    #     stt = time.time()
-    #     input_features = inputs["input_features"]
-    #     attention_mask = inputs["attention_mask"]
-    #     input_features = input_features.to(device)
-    #     attention_mask = attention_mask.to(device)
-    #     spk_cond_emb = get_emb(input_features, attention_mask)
-    #     print(f"get emb time: {time.time() - stt}, spk_cond_emb: {spk_cond_emb.shape}, input_features: {input_features.shape}")
-
-    #     stt = time.time()
-    #     cond_lengths = attention_mask.sum(dim=1).long()
-    #     semantic_code, _ = semantic_codec.quantize(spk_cond_emb)  # [1, code_len]
-    #     code_len = semantic_code.shape[1]
-    #     print(f"quantize time: {time.time() - stt}, semantic_code: {semantic_code.shape}")
-
-    #     stt = time.time()
-    #     feat_t = spk_cond_emb.transpose(1, 2)
-    #     cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
-    #     conditioning = gpt.get_conditioning(feat_t, cond_lengths_device)  # [1, 32, 1280]
-    #     emo_vec = gpt.get_emovec(spk_cond_emb, cond_lengths_device)  # [1, 1280]
-    #     print(f"get conditioning time: {time.time() - stt}, conditioning: {conditioning.shape}, emo_vec: {emo_vec.shape}")
-    #     print()
-
-    for _ in range(2):
-        stt_total = time.time()
+    stt_total = time.time()
+    semantic_codes = []
+    code_lens = []
+    conditionings = []
+    emo_vecs = []
+    for audio_16k in audio_16ks:
         stt = time.time()
         # for _ in range(1000):
-        inputs = extract_features(audio_16ks, sampling_rate=16000, return_tensors="pt")
-        print(f"extract features time: {time.time() - stt}")
+        inputs = extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        # print(f"extract features time: {time.time() - stt}")
 
         stt = time.time()
         input_features = inputs["input_features"]
@@ -146,22 +121,78 @@ with torch.no_grad():
         input_features = input_features.to(device)
         attention_mask = attention_mask.to(device)
         spk_cond_emb = get_emb(input_features, attention_mask)
-        print(f"get emb time: {time.time() - stt}, spk_cond_emb: {spk_cond_emb.shape}, input_features: {input_features.shape}")
+        # print(f"get emb time: {time.time() - stt}, spk_cond_emb: {spk_cond_emb.shape}, input_features: {input_features.shape}")
 
-        for b in range(batch_size):
-            spk_cond_emb_ = spk_cond_emb[b: b+1, :attention_mask[b].sum()]
         stt = time.time()
         cond_lengths = attention_mask.sum(dim=1).long()
         semantic_code, _ = semantic_codec.quantize(spk_cond_emb)  # [1, code_len]
         code_len = semantic_code.shape[1]
-        print(f"quantize time: {time.time() - stt}, semantic_code: {semantic_code.shape}")
+        # print(f"quantize time: {time.time() - stt}, semantic_code: {semantic_code.shape}, {semantic_code[:, :20]}")
+        semantic_codes.append(semantic_code.clone())
+        code_lens.append(code_len)
 
         stt = time.time()
         feat_t = spk_cond_emb.transpose(1, 2)
         cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
         conditioning = gpt.get_conditioning(feat_t, cond_lengths_device)  # [1, 32, 1280]
         emo_vec = gpt.get_emovec(spk_cond_emb, cond_lengths_device)  # [1, 1280]
-        print(f"get conditioning time: {time.time() - stt}, conditioning: {conditioning.shape}, emo_vec: {emo_vec.shape}")
+        # print(f"get conditioning time: {time.time() - stt}, conditioning: {conditioning.shape}, emo_vec: {emo_vec.shape}")
         print()
+
+        conditionings.append(conditioning.clone())
+        emo_vecs.append(emo_vec.clone())
+
+    semantic_codes1 = semantic_codes
+    code_lens1 = code_lens
+    conditioning1 = torch.cat(conditionings)
+    emo_vec1 = torch.cat(emo_vecs)
+
+    for _ in range(1):
+        stt_total = time.time()
+        stt = time.time()
+        # for _ in range(1000):
+        inputs = extract_features(audio_16ks, sampling_rate=16000, return_tensors="pt")
+        # print(f"extract features time: {time.time() - stt}")
+
+        stt = time.time()
+        input_features = inputs["input_features"]
+        attention_mask = inputs["attention_mask"]
+        input_features = input_features.to(device)
+        attention_mask = attention_mask.to(device)
+        spk_cond_emb = get_emb(input_features, attention_mask)
+        # print(f"get emb time: {time.time() - stt}, spk_cond_emb: {spk_cond_emb.shape}, input_features: {input_features.shape}")
+
+        stt = time.time()
+        cond_lengths = attention_mask.sum(dim=1).long()
+        semantic_code, _ = semantic_codec.quantize(spk_cond_emb)  # [1, code_len]
+        # code_len = semantic_code.shape[1]
+
+        semantic_codes = []
+        code_lens = []
+        for b in range(batch_size):
+            semantic_code_ = semantic_code[b: b+1, :cond_lengths[b]]
+            semantic_codes.append(semantic_code_)
+            code_lens.append(semantic_code_.shape[1])
+            print(f"quantize time: {time.time() - stt}, semantic_code: {semantic_code_.shape}, {semantic_code_[:, :20]}")
+
+        stt = time.time()
+        feat_t = spk_cond_emb.transpose(1, 2)
+        cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
+        conditionings = gpt.get_conditioning(feat_t, cond_lengths_device)  # [1, 32, 1280]
+        emo_vecs = gpt.get_emovec(spk_cond_emb, cond_lengths_device)  # [1, 1280]
+        # print(f"get conditioning time: {time.time() - stt}, conditioning: {conditioning.shape}, emo_vec: {emo_vec.shape}")
+        print()
+    
+    for semantic_code1, semantic_code2 in zip(semantic_codes1, semantic_codes):
+        len_ = min(semantic_code1.shape[1], semantic_code2.shape[1])
+        semantic_codes_diff = torch.sum(semantic_code1[:, :len_] - semantic_code2[:, :len_]) 
+        print(f"semantic_code1: {semantic_code1}")
+        print(f"semantic_code2: {semantic_code2}")
+        print(f"semantic_codes_diff: {semantic_codes_diff}")
+    
+    conditionings_l1 = torch.nn.L1Loss()(conditionings, conditioning1)
+    print(f"conditionings_l1: {conditionings_l1}")
+    emo_vecs_l1 = torch.nn.L1Loss()(emo_vecs, emo_vec1)
+    print(f"emo_vecs_l1: {emo_vecs_l1}")
 
 print(f"total time: {time.time() - stt_total}")

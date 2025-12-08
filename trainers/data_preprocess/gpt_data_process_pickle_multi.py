@@ -4,6 +4,7 @@ import random
 import sys
 import pickle
 import glob
+import threading
 import time
 import traceback
 from typing import Dict, List
@@ -35,13 +36,13 @@ OUTPUT_DIR = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Re
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
 TARGET_SR = 16000
 val_num = 128
-CPU_WORKERS_NUM = 2  # 负责读取和解码的CPU进程数
-DEVICE_NUM = 4
+CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
+DEVICE_NUM = 2
 PROCESSORS_PER_DEVICE = 1
 # processors_num = DEVICE_NUM * PROCESSORS_PER_DEVICE
 MAX_GPU_TASK_QUEUE_SIZE = 16  # 限制队列大小防止内存爆炸
 MAX_AUDIO_DURATION = 36
-BATCH_SIZE = 64
+BATCH_SIZE = 12
 
 
 @dataclass
@@ -92,8 +93,9 @@ class AudioLoaderWorker(Process):
                 valid_samples = []
                 
                 duration_skip_num = 0
+                pf_start_time = time.time()
                 # for idx, sample in tqdm(enumerate(ds), desc=f"CPU-Loader-{self.worker_id}"):  # , total=len(ds)
-                pbar = tqdm(desc=f"CPU-Loader-{self.worker_id}")
+                pbar = tqdm(desc=f"CPU-Loader-{self.worker_id}: {rel_path}")
                 for batch in parquet_file.iter_batches(batch_size=128, columns=['audio', 'text']):
                     rows = batch.to_pylist()
                     for sample in rows:
@@ -134,8 +136,8 @@ class AudioLoaderWorker(Process):
                             )
                             batch_req.append(req)
                             if len(batch_req) >= BATCH_SIZE:
-                                if self.gpu_task_queue.empty():
-                                    logger.error(f"[CPU-Loader-{self.worker_id}] gpu_task_queue is empty.")
+                                # if self.gpu_task_queue.empty():
+                                #     logger.error(f"[CPU-Loader-{self.worker_id}] gpu_task_queue is empty.")
                                 self.gpu_task_queue.put(batch_req)
                                 batch_req = []
                             # self.gpu_task_queue.put(req)
@@ -144,8 +146,9 @@ class AudioLoaderWorker(Process):
                         except Exception as e:
                             logger.error(f"Error processing audio in {rel_path}: {traceback.format_exc()}")
                             continue
+                        pbar.update(1)
                         # logger.error(f"[CPU-Loader-{self.worker_id}] Processed {rel_path}: {idx+1}/{len(ds)} samples. Time: {time.time()-stt:.2f}s")
-                logger.error(f"[CPU-Loader-{self.worker_id}] Processed {rel_path}: {len(valid_samples)} samples. Duration skip num: {duration_skip_num}")
+                logger.error(f"[CPU-Loader-{self.worker_id}: {rel_path}] Samples: {len(valid_samples)}. Duration skip: {duration_skip_num}, pf time: {time.time()-pf_start_time:.4f}s")
                 
                 # 发送清单给 Writer
                 if len(valid_samples) > 0:
@@ -173,7 +176,7 @@ class ResultWriterWorker(Process):
         logger.info("[Writer] Started.")
         
         # Buffer: { file_rel_path: {'expected': int, 'data': list, 'received': int} }
-        file_buffers = {}
+        self.file_buffers = {}
         finished_files_count = 0
         
         # 进度条
@@ -184,15 +187,13 @@ class ResultWriterWorker(Process):
             while not self.writer_control_queue.empty():
                 try:
                     manifest: FileManifest = self.writer_control_queue.get_nowait()
-                    if manifest.file_rel_path not in file_buffers:
-                        file_buffers[manifest.file_rel_path] = {
-                            'expected': manifest.total_samples,
-                            'data': [],
-                            'received': 0
-                        }
+                    if manifest.file_rel_path not in self.file_buffers:
+                        logger.error(f"[Writer] manifest.file_rel_path not in file_buffers: {manifest.file_rel_path}")
                     else:
-                        # 极端情况：结果比manifest先到（不太可能，因为loader是串行的），补全expected
-                        file_buffers[manifest.file_rel_path]['expected'] = manifest.total_samples
+                        self.file_buffers[manifest.file_rel_path]['expected'] = manifest.total_samples
+                        timer = threading.Timer(60.0, self._cleanup_stale_buffer, args=[file_rel_path])
+                        self.file_buffers[file_rel_path]['timer'] = timer
+                        timer.start()
                 except queue.Empty:
                     break
 
@@ -202,23 +203,28 @@ class ResultWriterWorker(Process):
                 for res_ in res:
                     file_rel_path, processed_data = res_
                     
-                    if file_rel_path not in file_buffers:
-                        file_buffers[file_rel_path] = {
+                    if file_rel_path not in self.file_buffers:
+                        self.file_buffers[file_rel_path] = {
                             'expected': -1, # 未知
                             'data': [],
-                            'received': 0
+                            'received': 0,
+                            'timer': None  # 预留定时器槽位
                         }
                     
-                    file_buffers[file_rel_path]['data'].append(processed_data)
-                    file_buffers[file_rel_path]['received'] += 1
+                    self.file_buffers[file_rel_path]['data'].append(processed_data)
+                    self.file_buffers[file_rel_path]['received'] += 1
                     
                     # 检查是否完成
-                    buf = file_buffers[file_rel_path]
+                    buf = self.file_buffers[file_rel_path]
                     if buf['expected'] != -1 and buf['received'] >= buf['expected']:
-                        self.save_file(file_rel_path, buf['data'])
-                        del file_buffers[file_rel_path]
-                        finished_files_count += 1
-                        pbar.update(1)
+                        if buf['timer'] is not None:
+                            buf['timer'].cancel()
+                        try:
+                            self.save_file(file_rel_path, buf['data'])
+                        finally:
+                            del self.file_buffers[file_rel_path]
+                            finished_files_count += 1
+                            pbar.update(1)
                     
             except queue.Empty:
                 continue
@@ -228,6 +234,19 @@ class ResultWriterWorker(Process):
 
         pbar.close()
         logger.info("[Writer] All files processed.")
+
+    def _cleanup_stale_buffer(self, file_rel_path):
+        """60秒超时后检查并强制清理未完成的缓冲区"""
+        if file_rel_path in self.file_buffers:
+            buf = self.file_buffers[file_rel_path]
+            if buf['expected'] != -1 and buf['received'] < buf['expected']:
+                logger.warning(
+                    f"[Writer] ⏰ Timeout after 60s for '{file_rel_path}': "
+                    f"received {buf['received']}/{buf['expected']} samples. "
+                    f"Force cleaning to prevent memory leak."
+                )
+                # 使用pop避免竞态KeyError
+                self.file_buffers.pop(file_rel_path, None)
 
     def save_file(self, rel_path, data_list):
         output_path = os.path.join(OUTPUT_DIR, rel_path.replace(".parquet", ".pkl"))

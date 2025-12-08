@@ -38,3 +38,5 @@ trained_ckpts/
 train_data/
 wandb/
 outputs/
+
+*.pkl
