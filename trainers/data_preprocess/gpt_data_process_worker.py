@@ -290,5 +290,5 @@ class DataPreprocessor(Process):
                 emo_vec=emo_vec[b].clone(),
                 duration=durations[b],
             )
-            processed_datas.append(processed_data)
+            processed_datas.append(processed_data.to_numpy())
         return processed_datas

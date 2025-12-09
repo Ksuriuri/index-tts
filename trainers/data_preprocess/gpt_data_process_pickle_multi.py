@@ -28,6 +28,7 @@ from trainers.data_preprocess.gpt_data_process_worker import DataPreprocessor, D
 from torch.multiprocessing import Process, Queue
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
+mp.set_sharing_strategy('file_system')
 
 
 random.seed(42)
@@ -216,7 +217,7 @@ class ResultWriterWorker(Process):
                     
                     # 检查是否完成
                     buf = self.file_buffers[file_rel_path]
-                    if buf['expected'] != -1 and buf['received'] >= buf['expected']:
+                    if buf['expected'] != -1 and buf['received'] >= buf['expected'] * 0.9:
                         if buf['timer'] is not None:
                             buf['timer'].cancel()
                         try:
@@ -245,8 +246,9 @@ class ResultWriterWorker(Process):
                     f"received {buf['received']}/{buf['expected']} samples. "
                     f"Force cleaning to prevent memory leak."
                 )
-                # 使用pop避免竞态KeyError
-                self.file_buffers.pop(file_rel_path, None)
+                # # 使用pop避免竞态KeyError
+                # self.file_buffers.pop(file_rel_path, None)
+                del self.file_buffers[file_rel_path]
 
     def save_file(self, rel_path, data_list):
         output_path = os.path.join(OUTPUT_DIR, rel_path.replace(".parquet", ".pkl"))
