@@ -9,10 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 from typing import Dict, List, Optional, Sequence, Set, Tuple
-import bisect
-from functools import lru_cache
-from concurrent.futures import ProcessPoolExecutor
-from tqdm.auto import tqdm
 
 # 原始路径设置
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from transformers import get_cosine_schedule_with_warmup
 from omegaconf import OmegaConf
@@ -35,15 +31,12 @@ import wandb
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.front import TextNormalizer, TextTokenizer
-from trainers.utils import ProcessedData
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Finetune IndexTTS2 GPT on Japanese data.")
     parser.add_argument("--train-data-path", type=str, required=True)
-    # parser.add_argument("--val-data-path", type=str, required=True)
-    parser.add_argument("--val-data-size", type=int, default=128, help="Validation data size.")
-    parser.add_argument("--data-cache-size", type=int, default=128, help="lru cache size for processed data.")
+    parser.add_argument("--val-data-path", type=str, required=True)
     parser.add_argument("--tokenizer", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/jp_bpe.model"), help="SentencePiece model path.")
     parser.add_argument("--config", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/config.yaml"), help="Model config YAML.")
     parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/gpt.pth"), help="Base GPT checkpoint.")
@@ -73,115 +66,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def count_samples_in_pkl(file_path: Path) -> int:
-    """辅助函数：只读取 pickle 的长度，尽量不完全反序列化大对象（取决于 pickle 实现）"""
-    try:
-        with open(file_path, 'rb') as f:
-            data = pickle.load(f)
-            return len(data)
-    except Exception as e:
-        print(f"[Error] Failed to read {file_path}: {e}")
-        return 0
+@dataclass
+class Sample:
+    text_ids: torch.Tensor
+    codes: torch.Tensor
+    text_len: int
+    code_len: int
+    condition: torch.Tensor
+    emo_vec: torch.Tensor
 
 
-class LazyJapaneseGPTDataset(Dataset):
-    def __init__(self, data_path: str, cache_size: int = 64, max_data_size: int = None):
-        """
-        Args:
-            data_path: 数据根目录
-            cache_size: 在内存中缓存多少个 .pkl 文件的数据。
-                        设置越大，IO 越少但内存占用越高。
-                        建议设置为 batch_size 的 2-4 倍左右，或者根据内存大小设定（如 128）。
-        """
-        self.data_path = Path(data_path)
-        self.cache_size = cache_size
-        
-        # 1. 找到所有 pkl 文件
-        if self.data_path.is_file():
-            self.file_paths = [self.data_path]
-        else:
-            self.file_paths = sorted(list(self.data_path.rglob("*.pkl")))
+class JapaneseGPTDataset(Dataset):
+    def __init__(self, data_path: str):
+        self.samples: List[Sample] = []
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Pickle file not found at: {data_path}")
             
-        if not self.file_paths:
-            raise FileNotFoundError(f"No .pkl files found in {data_path}")
-
-        print(f"[Dataset] Found {len(self.file_paths)} files. Indexing...")
-
-        # 2. 构建全局索引 (计算 cumulative sum)
-        self.file_lengths = []
-        with ProcessPoolExecutor() as executor:
-            self.file_lengths = list(tqdm(
-                executor.map(count_samples_in_pkl, self.file_paths),
-                total=len(self.file_paths),
-                desc="Indexing files"
-            ))
-
-        # 过滤掉空文件
-        valid_files = []
-        valid_lengths = []
-        for fp, length in zip(self.file_paths, self.file_lengths):
-            if length > 0:
-                valid_files.append(fp)
-                valid_lengths.append(length)
-        
-        self.file_paths = valid_files
-        self.file_lengths = valid_lengths
-
-        # 计算累积长度，用于二分查找
-        # 例如: lengths=[2, 3, 2] -> cumulative=[2, 5, 7]
-        # index 4 -> 4 < 5 -> 在第2个文件
-        self.cumulative_lengths = []
-        curr = 0
-        for l in self.file_lengths:
-            curr += l
-            self.cumulative_lengths.append(curr)
-            
-        self.total_samples = curr
-        print(f"[Dataset] Indexed {self.total_samples} samples across {len(self.file_paths)} files.")
-
-        # 初始化 LRU 缓存读取器
-        # 注意：这里我们绑定一个带缓存的方法
-        self._get_file_content_cached = lru_cache(maxsize=self.cache_size)(self._load_pkl_file)
-
-    def _load_pkl_file(self, file_path: Path):
-        """实际读取磁盘的方法"""
-        with open(file_path, 'rb') as f:
-            return pickle.load(f)
+        # print(f"Loading dataset from {data_path} ...")
+        with open(data_path, 'rb') as f:
+            self.samples = pickle.load(f)
+        # print(f"Loaded {len(self.samples)} samples successfully.")
 
     def __len__(self) -> int:
-        return self.total_samples
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 1. 找到 idx 属于哪个文件
-        # bisect_right 返回插入点，正好对应文件索引
-        file_idx = bisect.bisect_right(self.cumulative_lengths, idx)
-        
-        # 2. 计算在该文件内部的偏移量
-        if file_idx == 0:
-            sample_idx = idx
-        else:
-            sample_idx = idx - self.cumulative_lengths[file_idx - 1]
-
-        # 3. 获取文件路径
-        path = self.file_paths[file_idx]
-
-        # 4. 加载文件内容 (使用 LRU 缓存)
-        # 如果这个文件最近被读取过，直接从内存拿；否则从磁盘读并缓存
-        data_list = self._get_file_content_cached(path)
-
-        # 5. 获取样本
-        sample = data_list[sample_idx]
-        
-        # 6. 转 Tensor (复用之前的逻辑)
-        tensor_sample = sample.to_tensor()
-        
+        sample = self.samples[idx]
         return {
-            "text_ids": tensor_sample.text_ids,
-            "codes": tensor_sample.codes,
-            "condition": tensor_sample.condition,
-            "emo_vec": tensor_sample.emo_vec,
-            "text_len": torch.tensor(tensor_sample.text_len, dtype=torch.long),
-            "code_len": torch.tensor(tensor_sample.code_len, dtype=torch.long),
+            "text_ids": sample.text_ids.long(),
+            "codes": sample.codes.long(),
+            "condition": sample.condition,
+            "emo_vec": sample.emo_vec,
+            "text_len": torch.tensor(sample.text_len, dtype=torch.long),
+            "code_len": torch.tensor(sample.code_len, dtype=torch.long),
         }
 
 
@@ -435,23 +352,8 @@ def main() -> None:
         duration_dropout=args.duration_dropout
     )
 
-    full_dataset = LazyJapaneseGPTDataset(args.train_data_path, cache_size=args.data_cache_size)
-    total_size = len(full_dataset)
-    train_size = total_size - args.val_data_size
-    
-    # 使用固定种子进行切分，确保每次运行验证集都是同一批数据
-    # 即使 args.seed 不同，我们也希望数据划分相对稳定，或者你可以直接用 args.seed
-    generator = torch.Generator().manual_seed(args.seed)
-    
-    train_dataset, val_dataset = random_split(
-        full_dataset, 
-        [train_size, args.val_data_size], 
-        generator=generator
-    )
-    
-    if accelerator.is_main_process:
-        print(f"[Data] Splitting single dataset into Train/Val (Split ratio: {args.val_split}).")
-        print(f"[Data] Total: {total_size} -> Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    train_dataset = JapaneseGPTDataset(args.train_data_path)
+    val_dataset = JapaneseGPTDataset(args.val_data_path)
 
     # Accelerate 会自动处理 DataLoader 的 sampler (分布式切分)，这里通常不需要设置 shuffle (虽然设置了也没事)
     # 也不需要 pin_memory=True，Accelerate 会优化
@@ -461,7 +363,6 @@ def main() -> None:
         shuffle=True, 
         num_workers=args.num_workers,
         collate_fn=collate_batch,
-        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
@@ -469,7 +370,6 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_batch,
-        pin_memory=True
     )
 
     # optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -532,6 +432,8 @@ def main() -> None:
 
     model.train()
     
+    # 进度条 (只在主进程显示)
+    from tqdm.auto import tqdm
     progress_bar = tqdm(range(total_steps), disable=not accelerator.is_main_process)
     progress_bar.update(global_step)
 
