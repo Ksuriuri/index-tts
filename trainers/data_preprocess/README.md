@@ -1,4 +1,4 @@
-## gpt_data_process_pickle_multi.py
+## gpt_data_process_parquet.py
 主要用于并行处理 Galgame-VisualNovel-Reupload 数据集（.parquet子文件）为训练数据的 pickle 文件，保持原数据集的文件结构。
 
 ## count_num_and_duration.py

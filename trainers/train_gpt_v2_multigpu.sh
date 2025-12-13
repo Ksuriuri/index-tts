@@ -3,6 +3,9 @@ accelerate launch \
     --num_processes 8 \
     --mixed_precision fp16 \
     trainers/train_gpt_v2_multigpu.py \
+    --config checkpoints/IndexTTS-2-vLLM/config.yaml \
+    --tokenizer checkpoints/IndexTTS-2-vLLM/jp_bpe.model \
+    --base-checkpoint checkpoints/IndexTTS-2-vLLM/gpt.pth \
     --train-data-dir /mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload_arrow \
     --val-data-size 128 \
     --output-dir ./trained_ckpts \
@@ -10,7 +13,7 @@ accelerate launch \
     --grad-accumulation 1 \
     --num-workers 2 \
     --epochs 1 \
-    --learning-rate 2e-5 \
+    --learning-rate 5e-5 \
     --log-interval 10 \
     --val-interval 200 \
     --save_every 2000 \

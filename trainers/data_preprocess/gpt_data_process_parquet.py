@@ -9,26 +9,25 @@ import time
 import traceback
 from typing import Dict, List
 import numpy as np
-from tqdm import tqdm  # 用于显示进度条
+from tqdm import tqdm
 from loguru import logger
 import queue
 import pyarrow.parquet as pq
+import io
+import torch
+import torchaudio
+import soundfile as sf
+from torch.multiprocessing import Process, Queue
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
+mp.set_sharing_strategy('file_system')
 
 # 原始路径设置
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(root_dir)
 
-import io
-from datasets import load_dataset, Features
-from datasets import Value as ds_Value
-import torch
-import torchaudio
-import soundfile as sf
+
 from trainers.data_preprocess.gpt_data_process_worker import DataPreprocessor, DataPreprocessorReqData
-from torch.multiprocessing import Process, Queue
-import torch.multiprocessing as mp
-mp.set_start_method('spawn', force=True)
-mp.set_sharing_strategy('file_system')
 
 
 random.seed(42)
@@ -44,6 +43,7 @@ PROCESSORS_PER_DEVICE = 1
 MAX_GPU_TASK_QUEUE_SIZE = 16  # 限制队列大小防止内存爆炸
 MAX_AUDIO_DURATION = 36
 BATCH_SIZE = 12
+
 
 
 @dataclass
