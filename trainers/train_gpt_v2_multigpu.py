@@ -2,17 +2,14 @@ import argparse
 import json
 import math
 import os
-import pickle
 import random
 import datetime
-from dataclasses import dataclass
+from datasets import load_from_disk, concatenate_datasets
 from pathlib import Path
 import sys
 from typing import Dict, List, Optional, Sequence, Set, Tuple
-import bisect
-from functools import lru_cache
-from concurrent.futures import ProcessPoolExecutor
 from tqdm.auto import tqdm
+import shutil
 
 # 原始路径设置
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,10 +37,8 @@ from trainers.utils import ProcessedData
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Finetune IndexTTS2 GPT on Japanese data.")
-    parser.add_argument("--train-data-path", type=str, required=True)
-    # parser.add_argument("--val-data-path", type=str, required=True)
+    parser.add_argument("--train-data-dir", type=str, required=True, help="Path to the arrow dataset directory (containing part_*)")
     parser.add_argument("--val-data-size", type=int, default=128, help="Validation data size.")
-    parser.add_argument("--data-cache-size", type=int, default=128, help="lru cache size for processed data.")
     parser.add_argument("--tokenizer", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/jp_bpe.model"), help="SentencePiece model path.")
     parser.add_argument("--config", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/config.yaml"), help="Model config YAML.")
     parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/gpt.pth"), help="Base GPT checkpoint.")
@@ -57,9 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=0, help="Optional max optimiser steps (0 = unlimited).")
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between training log entries.")
     parser.add_argument("--val-interval", type=int, default=100, help="Validation frequency in steps.")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
+    parser.add_argument("--keep-last", type=int, default=2, help="Keep last N checkpoints.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping value.")
     parser.add_argument("--save_every", type=int, default=1000, help="save checkpoint every N steps")
+    parser.add_argument("--major-save-every", type=int, default=25000, help="Save a permanent checkpoint every N steps (never deleted).")
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint directory to resume from (accelerate style), or empty.")
     parser.add_argument("--use-duration-control", action="store_true", help="Train GPT with duration embeddings.")
     parser.add_argument("--duration-dropout", type=float, default=0.3, help="Probability of zeroing duration embeddings.")
@@ -73,115 +70,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def count_samples_in_pkl(file_path: Path) -> int:
-    """辅助函数：只读取 pickle 的长度，尽量不完全反序列化大对象（取决于 pickle 实现）"""
-    try:
-        with open(file_path, 'rb') as f:
-            data = pickle.load(f)
-            return len(data)
-    except Exception as e:
-        print(f"[Error] Failed to read {file_path}: {e}")
-        return 0
-
-
-class LazyJapaneseGPTDataset(Dataset):
-    def __init__(self, data_path: str, cache_size: int = 64, max_data_size: int = None):
+class ArrowJapaneseGPTDataset(Dataset):
+    def __init__(self, arrow_root_dir: str):
         """
         Args:
-            data_path: 数据根目录
-            cache_size: 在内存中缓存多少个 .pkl 文件的数据。
-                        设置越大，IO 越少但内存占用越高。
-                        建议设置为 batch_size 的 2-4 倍左右，或者根据内存大小设定（如 128）。
+            arrow_root_dir: 包含 part_0, part_1... 的根目录路径
         """
-        self.data_path = Path(data_path)
-        self.cache_size = cache_size
+        self.arrow_root_dir = Path(arrow_root_dir)
         
-        # 1. 找到所有 pkl 文件
-        if self.data_path.is_file():
-            self.file_paths = [self.data_path]
-        else:
-            self.file_paths = sorted(list(self.data_path.rglob("*.pkl")))
-            
-        if not self.file_paths:
-            raise FileNotFoundError(f"No .pkl files found in {data_path}")
+        # 1. 扫描所有分片目录
+        print(f"[Dataset] Scanning shards in {self.arrow_root_dir} ...")
+        shard_paths = sorted([
+            d for d in self.arrow_root_dir.iterdir() 
+            if d.is_dir() and d.name.startswith("part_")
+        ], key=lambda x: int(x.name.split("_")[-1])) # 按 part_后面的数字排序
 
-        print(f"[Dataset] Found {len(self.file_paths)} files. Indexing...")
+        if not shard_paths:
+            raise ValueError(f"No 'part_*' directories found in {self.arrow_root_dir}")
 
-        # 2. 构建全局索引 (计算 cumulative sum)
-        self.file_lengths = []
-        with ProcessPoolExecutor() as executor:
-            self.file_lengths = list(tqdm(
-                executor.map(count_samples_in_pkl, self.file_paths),
-                total=len(self.file_paths),
-                desc="Indexing files"
-            ))
-
-        # 过滤掉空文件
-        valid_files = []
-        valid_lengths = []
-        for fp, length in zip(self.file_paths, self.file_lengths):
-            if length > 0:
-                valid_files.append(fp)
-                valid_lengths.append(length)
+        # 2. 加载所有分片 (load_from_disk 是懒加载，速度很快)
+        # 注意：这里加载的是 Dataset 对象，还没有读取具体数据
+        datasets = [load_from_disk(str(p)) for p in shard_paths]
         
-        self.file_paths = valid_files
-        self.file_lengths = valid_lengths
-
-        # 计算累积长度，用于二分查找
-        # 例如: lengths=[2, 3, 2] -> cumulative=[2, 5, 7]
-        # index 4 -> 4 < 5 -> 在第2个文件
-        self.cumulative_lengths = []
-        curr = 0
-        for l in self.file_lengths:
-            curr += l
-            self.cumulative_lengths.append(curr)
-            
-        self.total_samples = curr
-        print(f"[Dataset] Indexed {self.total_samples} samples across {len(self.file_paths)} files.")
-
-        # 初始化 LRU 缓存读取器
-        # 注意：这里我们绑定一个带缓存的方法
-        self._get_file_content_cached = lru_cache(maxsize=self.cache_size)(self._load_pkl_file)
-
-    def _load_pkl_file(self, file_path: Path):
-        """实际读取磁盘的方法"""
-        with open(file_path, 'rb') as f:
-            return pickle.load(f)
+        # 3. 逻辑合并 (零拷贝，仅仅是索引合并)
+        self.dataset = concatenate_datasets(datasets)
+        
+        print(f"[Dataset] Loaded {len(datasets)} shards. Total samples: {len(self.dataset)}")
 
     def __len__(self) -> int:
-        return self.total_samples
+        return len(self.dataset)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 1. 找到 idx 属于哪个文件
-        # bisect_right 返回插入点，正好对应文件索引
-        file_idx = bisect.bisect_right(self.cumulative_lengths, idx)
-        
-        # 2. 计算在该文件内部的偏移量
-        if file_idx == 0:
-            sample_idx = idx
-        else:
-            sample_idx = idx - self.cumulative_lengths[file_idx - 1]
-
-        # 3. 获取文件路径
-        path = self.file_paths[file_idx]
-
-        # 4. 加载文件内容 (使用 LRU 缓存)
-        # 如果这个文件最近被读取过，直接从内存拿；否则从磁盘读并缓存
-        data_list = self._get_file_content_cached(path)
-
-        # 5. 获取样本
-        sample = data_list[sample_idx]
-        
-        # 6. 转 Tensor (复用之前的逻辑)
-        tensor_sample = sample.to_tensor()
+        # Arrow dataset 返回的是字典，里面的值通常是 Python list 或 numpy array
+        item = self.dataset[idx]
         
         return {
-            "text_ids": tensor_sample.text_ids,
-            "codes": tensor_sample.codes,
-            "condition": tensor_sample.condition,
-            "emo_vec": tensor_sample.emo_vec,
-            "text_len": torch.tensor(tensor_sample.text_len, dtype=torch.long),
-            "code_len": torch.tensor(tensor_sample.code_len, dtype=torch.long),
+            "text_ids": torch.tensor(item["text_ids"], dtype=torch.long),
+            "codes": torch.tensor(item["codes"], dtype=torch.long),
+            "condition": torch.tensor(item["condition"], dtype=torch.float32),
+            "emo_vec": torch.tensor(item["emo_vec"], dtype=torch.float32),
+            "text_len": torch.tensor(item["text_len"], dtype=torch.long),
+            "code_len": torch.tensor(item["code_len"], dtype=torch.long),
         }
 
 
@@ -375,6 +304,70 @@ def evaluate(
     return {k: v / count for k, v in totals.items()}
 
 
+def rotate_checkpoints(output_dir: Path, keep_last: int, major_save_every: int, accelerator: Accelerator):
+    """
+    保留最新的 keep_last 个检查点。
+    - 忽略（不删除）能被 major_save_every 整除的节点。
+    - 删除旧节点时，同时删除 'checkpoint-XXX' 文件夹和 'model_stepXXX.pth' 文件。
+    """
+    # 只在主进程执行删除操作
+    if not accelerator.is_main_process:
+        return
+
+    # 1. 找到所有 checkpoint-X 文件夹
+    glob_checkpoints = list(output_dir.glob("checkpoint-*"))
+    checkpoints = []
+    
+    for path in glob_checkpoints:
+        if not path.is_dir():
+            continue
+        try:
+            # 解析步数，例如 checkpoint-2000 -> 2000
+            step = int(path.name.split("-")[-1])
+            checkpoints.append((step, path))
+        except ValueError:
+            continue
+
+    # 按步数从小到大排序
+    checkpoints.sort(key=lambda x: x[0])
+
+    # 2. 分离 "普通节点" 和 "重大节点"
+    regular_checkpoints = []
+    
+    for step, path in checkpoints:
+        if major_save_every > 0 and step % major_save_every == 0:
+            # 这是一个重大节点 (比如 25000)，跳过，不放入待删除列表
+            continue
+        else:
+            regular_checkpoints.append((step, path))
+
+    # 3. 如果普通节点超过了 keep_last，删除最旧的
+    if len(regular_checkpoints) > keep_last:
+        # 计算需要删除的数量
+        num_to_delete = len(regular_checkpoints) - keep_last
+        # 获取要删除的列表（前 num_to_delete 个就是最旧的）
+        to_delete = regular_checkpoints[:num_to_delete]
+        
+        for step, folder_path in to_delete:
+            print(f"[Checkpoint] Rotate: Deleting old step {step}...")
+            
+            # --- 删除文件夹 checkpoint-XXX ---
+            try:
+                shutil.rmtree(folder_path)
+                print(f"  - Deleted dir: {folder_path.name}")
+            except OSError as e:
+                print(f"  - [Error] Failed to delete dir {folder_path}: {e}")
+
+            # --- 删除对应的 .pth 文件 model_stepXXX.pth ---
+            pth_path = output_dir / f"model_step{step}.pth"
+            if pth_path.exists():
+                try:
+                    os.remove(pth_path) # 或者 pth_path.unlink()
+                    print(f"  - Deleted file: {pth_path.name}")
+                except OSError as e:
+                    print(f"  - [Error] Failed to delete file {pth_path}: {e}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -435,7 +428,7 @@ def main() -> None:
         duration_dropout=args.duration_dropout
     )
 
-    full_dataset = LazyJapaneseGPTDataset(args.train_data_path, cache_size=args.data_cache_size)
+    full_dataset = ArrowJapaneseGPTDataset(args.train_data_dir)
     total_size = len(full_dataset)
     train_size = total_size - args.val_data_size
     
@@ -450,7 +443,6 @@ def main() -> None:
     )
     
     if accelerator.is_main_process:
-        print(f"[Data] Splitting single dataset into Train/Val (Split ratio: {args.val_split}).")
         print(f"[Data] Total: {total_size} -> Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     # Accelerate 会自动处理 DataLoader 的 sampler (分布式切分)，这里通常不需要设置 shuffle (虽然设置了也没事)
@@ -597,19 +589,33 @@ def main() -> None:
                     )
 
                 # Saving Checkpoint
-                if global_step % args.save_every == 0:
-                    # 1. Save full state for resuming (optimizer, scheduler, etc.)
+                is_regular_save = (global_step % args.save_every == 0)
+                is_major_save = (args.major_save_every > 0 and global_step % args.major_save_every == 0)
+                if (is_regular_save or is_major_save) and global_step > 0:
+                    # 确保所有进程同步
+                    accelerator.wait_for_everyone()
+                    
+                    # 1. 保存完整状态 (checkpoint-STEP)
                     save_path = output_dir / f"checkpoint-{global_step}"
+                    # accelerate 的 save_state 会自动处理主进程写文件
                     accelerator.save_state(save_path)
                     
-                    # 2. Save pure model weights for inference (optional but useful)
-                    # 只在主进程保存
-                    accelerator.wait_for_everyone()
+                    # 2. 保存纯权重 & 执行轮换清理 (只在主进程)
                     if accelerator.is_main_process:
+                        # 保存 .pth 模型文件
                         unwrapped_wrapper = accelerator.unwrap_model(model)
                         real_model = unwrapped_wrapper.model 
                         weight_path = output_dir / f"model_step{global_step}.pth"
                         torch.save({"model": real_model.state_dict()}, weight_path)
+                        print(f"[Checkpoint] Saved checkpoint to {save_path}")
+
+                        # 执行轮换：保留4个最新的，除非是25000的倍数
+                        rotate_checkpoints(
+                            output_dir=output_dir,
+                            keep_last=args.keep_last,
+                            major_save_every=args.major_save_every,
+                            accelerator=accelerator
+                        )
                     
             if args.max_steps and global_step >= args.max_steps:
                 break

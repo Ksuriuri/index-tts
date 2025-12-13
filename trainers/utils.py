@@ -6,13 +6,12 @@ import numpy as np
 
 @dataclass
 class ProcessedData:
-    # 使用 Union 允许该字段既可以是 Tensor 也可以是 Numpy，避免IDE报错
-    text_ids: Union[torch.Tensor, np.ndarray]  # int16
-    codes: Union[torch.Tensor, np.ndarray]     # int16
+    text_ids: Union[torch.Tensor, np.ndarray]  # int16, [text_len]
+    codes: Union[torch.Tensor, np.ndarray]     # int16, [code_len]
     text_len: int
     code_len: int
-    condition: Union[torch.Tensor, np.ndarray] # float16
-    emo_vec: Union[torch.Tensor, np.ndarray]   # float16
+    condition: Union[torch.Tensor, np.ndarray] # float16, [32, 1280]
+    emo_vec: Union[torch.Tensor, np.ndarray]   # float16, [1280]
     duration: float
 
     def to_numpy(self):
@@ -27,15 +26,21 @@ class ProcessedData:
             
         if isinstance(self.emo_vec, torch.Tensor):
             self.emo_vec = self.emo_vec.detach().cpu().numpy()
+
+        self.text_ids = self.text_ids.astype(np.int16)
+        self.codes = self.codes.astype(np.int16)
+        
+        self.condition = self.condition.astype(np.float16)
+        self.emo_vec = self.emo_vec.astype(np.float16)
             
         return self
 
     def to_tensor(self, device: str = "cpu"):
         if isinstance(self.text_ids, np.ndarray):
-            self.text_ids = torch.from_numpy(self.text_ids).to(device=device, dtype=torch.int32)
+            self.text_ids = torch.from_numpy(self.text_ids).to(device=device, dtype=torch.long)
 
         if isinstance(self.codes, np.ndarray):
-            self.codes = torch.from_numpy(self.codes).to(device=device, dtype=torch.int32)
+            self.codes = torch.from_numpy(self.codes).to(device=device, dtype=torch.long)
             
         if isinstance(self.condition, np.ndarray):
             self.condition = torch.from_numpy(self.condition).to(device=device, dtype=torch.float32)

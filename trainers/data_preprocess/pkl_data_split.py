@@ -18,6 +18,8 @@ def split_pkl_files(root_dir, chunk_size=1000):
     # 1. 扫描文件
     files_to_process = []
     print(f"正在扫描目录: {root_dir} ...")
+
+    skipped_count = 0
     
     for dirpath, dirnames, filenames in os.walk(root_dir):
         for filename in filenames:
@@ -25,9 +27,18 @@ def split_pkl_files(root_dir, chunk_size=1000):
                 # 跳过已经是切分过的文件
                 if f"-{split_mark}-" in filename:
                     continue
+
+                base_name = os.path.splitext(filename)[0]
+                check_split_0 = os.path.join(dirpath, f"{base_name}-{split_mark}-0.pkl")
+                if os.path.exists(check_split_0):
+                    skipped_count += 1
+                    continue
+
                 files_to_process.append(os.path.join(dirpath, filename))
 
-    print(f"共发现 {len(files_to_process)} 个需要处理的 .pkl 文件。")
+    print(f"扫描结束：")
+    print(f"  - 已跳过 (已存在split版本): {skipped_count} 个文件")
+    print(f"  - 待处理: {len(files_to_process)} 个文件")
 
     # 2. 遍历处理
     for file_path in tqdm(files_to_process, desc="Processing Files"):
@@ -82,7 +93,7 @@ if __name__ == "__main__":
     
     if os.path.exists(TARGET_DIR):
         # 默认 chunk_size=1000，即如果尾部少于 500，会合并到前一个
-        split_pkl_files(TARGET_DIR, chunk_size=2000)
+        split_pkl_files(TARGET_DIR, chunk_size=1000)
         print("\n处理完成！")
     else:
         print(f"错误: 目录不存在 - {TARGET_DIR}")

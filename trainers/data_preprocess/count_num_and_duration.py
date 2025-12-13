@@ -1,7 +1,9 @@
+from collections import OrderedDict
 import os
 import pickle
 import sys
 import numpy as np
+import matplotlib.pyplot as plt  # 引入绘图库
 
 # 原始路径设置
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,27 +18,36 @@ from trainers.utils import ProcessedData
 
 def process_single_file(file_path):
     """
-    返回: (处理是否成功(int 0/1), 该文件包含的总时长(float))
+    返回: (处理是否成功(int 0/1), 该文件包含的总时长(float), 时长分布字典(Dict))
     """
     file_duration = 0.0
+    duration_distribution: Dict[int, int] = {}
     try:
         with open(file_path, 'rb') as f:
             data_list = pickle.load(f)
         
         if isinstance(data_list, list):
-            # for item in tqdm(data_list, desc="Processing file"):
             for item in data_list:
                 if isinstance(item, ProcessedData):
                     file_duration += item.duration
+                    # 四舍五入取整
+                    d_int = int(item.duration + 0.5)
+                    if d_int not in duration_distribution:
+                        duration_distribution[d_int] = 0
+                    duration_distribution[d_int] += 1
             
-        return 1, file_duration  # 成功计数1，返回时长
+        return 1, file_duration, duration_distribution  # 成功
         
     except Exception as e:
         print(f"\nError processing {file_path}: {e}")
-        return 0, 0.0
+        # [修复] 这里必须返回3个值，否则主进程解包时会报错
+        return 0, 0.0, {}
 
 # --- 主逻辑 ---
 def main():
+    # 设置中文字体（可选，如果系统支持，防止中文乱码，这里暂用英文）
+    plt.rcParams['axes.unicode_minus'] = False 
+
     target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
     
     if not os.path.exists(target_dir):
@@ -45,41 +56,85 @@ def main():
 
     print("Scanning files...")
     all_files = []
-    # 1. 先遍历收集所有文件路径
     for dirpath, dirnames, filenames in os.walk(target_dir):
         for filename in filenames:
-            if filename.endswith(".pkl"):
+            if filename.endswith(".pkl") and "-split-pkl-" in filename:
                 all_files.append(os.path.join(dirpath, filename))
     
     total_files_count = len(all_files)
     print(f"Found {total_files_count} .pkl files. Starting multiprocessing...")
 
+    # [注意] 调试模式只取前8个，正式跑请去掉这行
+    # all_files = all_files[:8] 
+    
     success_count = 0
     total_duration_sec = 0.0
 
     # 2. 多进程处理
-    # max_workers默认是CPU核心数，适合IO+计算混合型任务
-    with ProcessPoolExecutor(max_workers=16) as executor:
-        # 使用tqdm显示进度条
-        results = list(tqdm(executor.map(process_single_file, all_files), total=total_files_count, unit="file"))
+    # 为了避免 all_files 切片导致 total 计数对不上，重新计算处理数量
+    files_to_process = all_files 
+    
+    results = []
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        results = list(tqdm(executor.map(process_single_file, files_to_process), total=len(files_to_process), unit="file"))
 
     # 3. 统计结果
-    for success, duration in results:
+    final_distribution: Dict[int, int] = {}
+    
+    for success, duration, dist_sub in results:
         success_count += success
         total_duration_sec += duration
+        
+        # 合并字典
+        for k, v in dist_sub.items():
+            if k not in final_distribution:
+                final_distribution[k] = 0
+            final_distribution[k] += v
 
-    # for file_path in tqdm(all_files, total=total_files_count):
-    #     success, duration = process_single_file(file_path)
-    #     success_count += success
-    #     total_duration_sec += duration
+    # 4. 排序与绘图 (新增部分)
+    print("\n" + "="*40)
+    print("final_distribution: ", final_distribution)
+    print("Generating Plot...")
+    
+    if final_distribution:
+        # 按时长(key)排序
+        sorted_durations = sorted(final_distribution.keys())
+        counts = [final_distribution[k] for k in sorted_durations]
 
-    # 4. 输出格式化时间
+        # 创建图表
+        plt.figure(figsize=(12, 6), dpi=100)
+        
+        # 绘制柱状图
+        plt.bar(sorted_durations, counts, color='skyblue', edgecolor='blue', alpha=0.7)
+        
+        # 设置标题和标签
+        plt.title('Audio Duration Distribution', fontsize=16)
+        plt.xlabel('Duration (Seconds)', fontsize=12)
+        plt.ylabel('Count (Number of Files)', fontsize=12)
+        
+        # 添加网格
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+        
+        # 如果数据点不过于密集，可以在柱子上显示数值（可选）
+        # for a, b in zip(sorted_durations, counts):
+        #     plt.text(a, b, str(b), ha='center', va='bottom', fontsize=8)
+
+        # 保存图片到当前目录
+        save_name = "duration_distribution.png"
+        plt.savefig(save_name)
+        print(f"Plot saved to: {os.path.abspath(save_name)}")
+        
+        # 关闭图表释放内存
+        plt.close()
+    else:
+        print("No data found to plot.")
+
+    # 5. 输出文本统计
     print("\n" + "="*40)
     print("Processing Complete")
     print("="*40)
-    print(f"Processed Files: {success_count} / {total_files_count}")
+    print(f"Processed Files: {success_count} / {len(files_to_process)}")
     
-    # 时长统计
     seconds = total_duration_sec
     minutes = seconds / 60
     hours = minutes / 60
@@ -91,3 +146,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+# ========================================
+# final_distribution:  {6: 687085, 9: 316329, 7: 556328, 4: 937028, 5: 817985, 3: 946003, 2: 856137, 10: 226448, 1: 686886, 13: 73858, 8: 429961, 15: 32520, 11: 158027, 12: 108155, 14: 48928, 17: 14071, 18: 9164, 16: 21370, 0: 37674, 25: 486, 19: 6034, 20: 3772, 22: 1691, 21: 2497, 24: 761, 27: 216, 28: 185, 26: 353, 23: 1141, 29: 100, 30: 72, 34: 24, 31: 53, 36: 5, 32: 32, 35: 18, 33: 20}
+# Generating Plot...
+# Plot saved to: /mnt/data_sdd/hhy/index-tts/duration_distribution.png
+
+# ========================================
+# Processing Complete
+# ========================================
+# Processed Files: 7008 / 7008
+# Total Duration (Seconds): 35912827.47 s
+# Total Duration (Minutes): 598547.12 min
+# Total Duration (Hours)  : 9975.79 hours
+# ========================================
