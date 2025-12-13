@@ -35,11 +35,9 @@ DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Galgame-VisualNovel-Reupload"
 OUTPUT_DIR = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
 TARGET_SR = 16000
-val_num = 128
 CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
-DEVICE_NUM = 2
+DEVICE_NUM = 8
 PROCESSORS_PER_DEVICE = 1
-# processors_num = DEVICE_NUM * PROCESSORS_PER_DEVICE
 MAX_GPU_TASK_QUEUE_SIZE = 16  # 限制队列大小防止内存爆炸
 MAX_AUDIO_DURATION = 36
 BATCH_SIZE = 12
@@ -64,7 +62,6 @@ class AudioLoaderWorker(Process):
 
     def run(self):
         logger.info(f"[CPU-Loader-{self.worker_id}] Started.")
-        resamplers: Dict[int, torchaudio.transforms.Resample] = {}
         batch_req = []
         while True:
             try:
@@ -91,76 +88,82 @@ class AudioLoaderWorker(Process):
                 # }))
                 parquet_file = pq.ParquetFile(parquet_path)
 
-                valid_samples = []
+                valid_count = 0
                 
                 duration_skip_num = 0
+                non_audio_or_text_skip_num = 0
                 pf_start_time = time.time()
                 # for idx, sample in tqdm(enumerate(ds), desc=f"CPU-Loader-{self.worker_id}"):  # , total=len(ds)
                 pbar = tqdm(desc=f"CPU-Loader-{self.worker_id}: {rel_path}")
-                for batch in parquet_file.iter_batches(batch_size=128, columns=['audio', 'text']):
-                    rows = batch.to_pylist()
-                    for sample in rows:
+                for batch in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text']):
+                    # rows = batch.to_pylist()
+                    audio_col = batch['audio']
+                    text_col = batch['text']
+                    for i in range(len(batch)):
                         # stt = time.time()
-                        audio_bytes = sample['audio']['bytes']
-                        text = sample['text']
+                        text = str(text_col[i]) # 转换为 Python str
+                        audio_struct = audio_col[i]
+                        # 某些 pyarrow 版本可能需要 .as_py() 或直接访问
+                        try:
+                            audio_bytes = audio_struct['bytes'].as_py()
+                        except:
+                            # 兼容性写法，如果直接访问失败
+                             audio_bytes = audio_struct.as_py()['bytes']
                         
                         if not audio_bytes or not text:
+                            non_audio_or_text_skip_num += 1
                             continue
 
                         try:
                             # 音频解码
-                            array, sampling_rate = sf.read(io.BytesIO(audio_bytes))
+                            array, sampling_rate = sf.read(io.BytesIO(audio_bytes), dtype='float32')
                             duration = array.shape[0] / sampling_rate
                             if duration > MAX_AUDIO_DURATION:
                                 duration_skip_num += 1
                                 continue
-                            waveform = torch.from_numpy(array).float()
-                            
-                            # 转单声道
-                            if waveform.dim() > 1:
-                                waveform = torch.mean(waveform, dim=1)
-                            
-                            # 重采样
-                            if sampling_rate != TARGET_SR:
-                                if sampling_rate not in resamplers:
-                                    resamplers[sampling_rate] = torchaudio.transforms.Resample(orig_freq=sampling_rate, new_freq=TARGET_SR)
-                                waveform = resamplers[sampling_rate](waveform)
-                                # waveform = torchaudio.functional.resample(waveform, orig_freq=sampling_rate, new_freq=TARGET_SR)
-                            
-                            # # 关键：放入共享内存
-                            # waveform.share_memory_()
+
+                            # 转单声道 (numpy操作)
+                            if array.ndim > 1:
+                                array = np.mean(array, axis=1)
                             
                             req = DataPreprocessorReqData(
                                 text=text,
-                                audio=waveform,
+                                audio=array, # float32 numpy array
+                                orig_sr=sampling_rate,
                                 file_rel_path=rel_path,
                             )
                             batch_req.append(req)
+                            valid_count += 1
+
                             if len(batch_req) >= BATCH_SIZE:
                                 # if self.gpu_task_queue.empty():
                                 #     logger.error(f"[CPU-Loader-{self.worker_id}] gpu_task_queue is empty.")
                                 self.gpu_task_queue.put(batch_req)
                                 batch_req = []
                             # self.gpu_task_queue.put(req)
-                            valid_samples.append(req)
 
                         except Exception as e:
                             logger.error(f"Error processing audio in {rel_path}: {traceback.format_exc()}")
                             continue
                         pbar.update(1)
-                        # logger.error(f"[CPU-Loader-{self.worker_id}] Processed {rel_path}: {idx+1}/{len(ds)} samples. Time: {time.time()-stt:.2f}s")
-                logger.error(f"[CPU-Loader-{self.worker_id}: {rel_path}] Samples: {len(valid_samples)}. Duration skip: {duration_skip_num}, pf time: {time.time()-pf_start_time:.4f}s")
+                logger.error(f"[CPU-Loader-{self.worker_id}: {rel_path}] Samples: {valid_count}. \
+                             Duration skip: {duration_skip_num}, non_audio_or_text skip: {non_audio_or_text_skip_num}, pf time: {time.time()-pf_start_time:.4f}s")
+                            
+                # 发送剩余的 batch
+                if len(batch_req) > 0:
+                    self.gpu_task_queue.put(batch_req)
+                    batch_req = []
                 
                 # 发送清单给 Writer
-                if len(valid_samples) > 0:
+                if valid_count > 0:
                     manifest = FileManifest(
                         file_rel_path=rel_path,
-                        total_samples=len(valid_samples),
+                        total_samples=valid_count,
                         original_path=parquet_path
                     )
                     self.writer_control_queue.put(manifest)
                 
-                # logger.debug(f"[CPU-Loader-{self.worker_id}] Processed {rel_path}: {len(valid_samples)} samples.")
+                # logger.debug(f"[CPU-Loader-{self.worker_id}] Processed {rel_path}: {valid_count} samples.")
 
             except Exception as e:
                 logger.error(f"[CPU-Loader-{self.worker_id}] File Error {parquet_path}: {traceback.format_exc()}")

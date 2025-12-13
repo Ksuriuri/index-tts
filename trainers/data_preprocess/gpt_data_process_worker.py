@@ -1,14 +1,17 @@
 from dataclasses import dataclass
 import os
+import queue
 import sys
 import time
 import traceback
 from typing import List
 from loguru import logger
+import torchaudio
 
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(root_dir)
 
+import numpy as np
 from omegaconf import OmegaConf
 import torch
 from torch.multiprocessing import Process, Queue
@@ -21,14 +24,14 @@ from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
 from trainers.utils import ProcessedData
 
+TARGET_SR = 16000
+
 @dataclass
 class DataPreprocessorReqData:
-    """
-    audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]  # , share_memory
-    """
     text: str
-    audio: torch.Tensor
-    file_rel_path: str  # 用于追踪数据属于哪个文件
+    audio: np.ndarray  # 改为 numpy，减少序列化开销
+    orig_sr: int       # 传递原始采样率
+    file_rel_path: str
 
 
 class DataPreprocessor(Process):
@@ -47,6 +50,9 @@ class DataPreprocessor(Process):
         self.gpu_id = gpu_id
         self.input_queue = input_queue
         self.output_queue = output_queue
+
+        # 缓存 GPU 上的重采样器
+        self.resamplers = {} 
 
     def init_models(self):
         cfg_path = os.path.join(self.model_dir, "config.yaml")
@@ -68,7 +74,7 @@ class DataPreprocessor(Process):
         logger.info(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] gpt initializing...')
 
         self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
-            os.path.join(self.model_dir, "w2v-bert-2.0")
+            os.path.join(self.model_dir, "w2v-bert-2.0"),
         )
 
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
@@ -96,6 +102,15 @@ class DataPreprocessor(Process):
         for param in self.semantic_codec.parameters():
             param.requires_grad = False
 
+    def get_resampler(self, orig_freq):
+        """在 GPU 上获取或创建重采样器"""
+        if orig_freq not in self.resamplers:
+            self.resamplers[orig_freq] = torchaudio.transforms.Resample(
+                orig_freq=orig_freq, 
+                new_freq=TARGET_SR
+            ).to(self.device)
+        return self.resamplers[orig_freq]
+
     def healthy_check(self):
         try:
             fake_audio = torch.zeros(16000, dtype=torch.float32)
@@ -118,29 +133,58 @@ class DataPreprocessor(Process):
                     break
             except Exception as e:
                 logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] init models error: {e}')
+
         while init_flag:
-            input_data: List[DataPreprocessorReqData] = self.input_queue.get()
+            try:
+                input_data: List[DataPreprocessorReqData] = self.input_queue.get(timeout=10)
+            except queue.Empty:
+                continue # 或者检查退出标志
+
             if input_data is None:
                 break
 
-            processed_datas_req = []
             try:
-                texts, audios = [], []
-                for input_data_ in input_data:
-                    # processed_data = self.preprocess(input_data_.text, input_data_.audio)
-                    # processed_datas_req.append((input_data_.file_rel_path, processed_data))
-                    texts.append(input_data_.text)
-                    audios.append(input_data_.audio)
-                processed_datas = self.preprocess_batch(texts, audios)
-                for i, processed_data in enumerate(processed_datas):
-                    processed_datas_req.append((input_data[i].file_rel_path, processed_data))
-                self.output_queue.put(processed_datas_req)
+                # processed_datas_req = []
+                # texts, audios = [], []
+                # for input_data_ in input_data:
+                #     # processed_data = self.preprocess(input_data_.text, input_data_.audio)
+                #     # processed_datas_req.append((input_data_.file_rel_path, processed_data))
+                #     texts.append(input_data_.text)
+                #     audios.append(input_data_.audio)
+                # processed_datas = self.preprocess_batch(texts, audios)
+                # for i, processed_data in enumerate(processed_datas):
+                #     processed_datas_req.append((input_data[i].file_rel_path, processed_data))
+                # self.output_queue.put(processed_datas_req)
+                processed_results = self.preprocess_batch_logic(input_data)
+                self.output_queue.put(processed_results)
             except Exception as e:
                 logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] preprocess error: {traceback.format_exc()}')
-                if self.healthy_check():
-                    continue
-                else:
+                if not self.healthy_check():
                     break
+
+    @torch.no_grad()
+    def preprocess_batch_logic(self, input_data_list: List[DataPreprocessorReqData]):
+        texts = [d.text for d in input_data_list]
+        
+        audio_tensors = []
+        for d in input_data_list:
+            wav = torch.from_numpy(d.audio)
+            # move to GPU (Async copy usually)
+            wav = wav.to(self.device, non_blocking=True)
+            
+            # GPU Resample
+            if d.orig_sr != TARGET_SR:
+                resampler = self.get_resampler(d.orig_sr)
+                wav = resampler(wav)
+            
+            audio_tensors.append(wav)
+        
+        processed_datas = self.preprocess_batch(texts, audio_tensors)
+        
+        results = []
+        for i, p_data in enumerate(processed_datas):
+            results.append((input_data_list[i].file_rel_path, p_data))
+        return results
 
     def get_emb(self, input_features, attention_mask):
         vq_emb = self.semantic_model(
@@ -243,7 +287,7 @@ class DataPreprocessor(Process):
 
         # Extract Features
         # stt = time.time()
-        inputs = self.extract_features(audios, sampling_rate=16000, return_tensors="pt")
+        inputs = self.extract_features([a.cpu().numpy() for a in audios], sampling_rate=16000, return_tensors="pt")
         input_features = inputs["input_features"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
         # logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] extract_features time: {time.time() - stt:.2f}s')

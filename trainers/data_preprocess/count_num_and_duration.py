@@ -48,7 +48,8 @@ def main():
     # 设置中文字体（可选，如果系统支持，防止中文乱码，这里暂用英文）
     plt.rcParams['axes.unicode_minus'] = False 
 
-    target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
+    # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
+    target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Gacha_games_jp"
     
     if not os.path.exists(target_dir):
         print(f"Directory not found: {target_dir}")
@@ -58,7 +59,7 @@ def main():
     all_files = []
     for dirpath, dirnames, filenames in os.walk(target_dir):
         for filename in filenames:
-            if filename.endswith(".pkl") and "-split-pkl-" in filename:
+            if filename.endswith(".pkl"):  #  and "-split-pkl-" in filename
                 all_files.append(os.path.join(dirpath, filename))
     
     total_files_count = len(all_files)
@@ -75,7 +76,7 @@ def main():
     files_to_process = all_files 
     
     results = []
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=4) as executor:
         results = list(tqdm(executor.map(process_single_file, files_to_process), total=len(files_to_process), unit="file"))
 
     # 3. 统计结果
@@ -162,4 +163,21 @@ if __name__ == "__main__":
 # Total Duration (Seconds): 35912827.47 s
 # Total Duration (Minutes): 598547.12 min
 # Total Duration (Hours)  : 9975.79 hours
+# ========================================
+
+
+
+
+# ========================================
+# final_distribution:  {3: 18799, 1: 8911, 9: 12426, 4: 21295, 8: 14825, 7: 16893, 13: 5148, 5: 20747, 6: 19265, 11: 8636, 2: 14597, 12: 6661, 10: 10594, 15: 3017, 16: 2268, 14: 4003, 18: 1307, 19: 981, 0: 779, 24: 322, 20: 760, 23: 357, 17: 1590, 31: 87, 27: 164, 30: 91, 22: 449, 26: 197, 34: 61, 29: 124, 36: 26, 25: 294, 35: 55, 33: 77, 32: 88, 21: 583, 28: 170}
+# Generating Plot...
+# Plot saved to: /mnt/data_sdd/hhy/index-tts/duration_distribution.png
+
+# ========================================
+# Processing Complete
+# ========================================
+# Processed Files: 4457 / 4457
+# Total Duration (Seconds): 1395921.67 s
+# Total Duration (Minutes): 23265.36 min
+# Total Duration (Hours)  : 387.76 hours
 # ========================================
