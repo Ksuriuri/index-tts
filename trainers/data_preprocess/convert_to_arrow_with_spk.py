@@ -17,7 +17,7 @@ from trainers.utils import ProcessedData
 # ================= 配置区域 =================
 SOURCE_NAME = "Gacha_games_jp"
 SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{SOURCE_NAME}"
-TARGET_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{SOURCE_NAME}_arrow"
+TARGET_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/final_train_data/{SOURCE_NAME}_arrow"
 SHARD_SIZE = 20000  # 每个分片包含的数据量
 MIN_DURATION = 0
 

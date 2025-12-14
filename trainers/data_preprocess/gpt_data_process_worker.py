@@ -32,6 +32,7 @@ class DataPreprocessorReqData:
     audio: np.ndarray  # 改为 numpy，减少序列化开销
     orig_sr: int       # 传递原始采样率
     file_rel_path: str
+    speaker_id: str = None
 
 
 class DataPreprocessor(Process):
@@ -57,6 +58,7 @@ class DataPreprocessor(Process):
     def init_models(self):
         cfg_path = os.path.join(self.model_dir, "config.yaml")
         cfg = OmegaConf.load(cfg_path)
+        cfg.gpt.number_text_tokens = 12000  # 使用原始权重
 
         self.device = torch.device(f"cuda")  # :{self.gpu_id}
         self.dtype = torch.float32
@@ -67,7 +69,7 @@ class DataPreprocessor(Process):
         self.tokenizer = TextTokenizer(bpe_path, normalizer)
 
         self.gpt = UnifiedVoice(**cfg.gpt)
-        gpt_path = os.path.join(self.model_dir, cfg.gpt_checkpoint)
+        gpt_path = os.path.join(self.model_dir, "gpt.pth")  # 使用原始权重
         load_checkpoint(self.gpt, gpt_path)
         self.gpt = self.gpt.to(self.device)
         self.gpt.eval() # 确保进入eval模式
@@ -106,7 +108,7 @@ class DataPreprocessor(Process):
         """在 GPU 上获取或创建重采样器"""
         if orig_freq not in self.resamplers:
             self.resamplers[orig_freq] = torchaudio.transforms.Resample(
-                orig_freq=orig_freq, 
+                orig_freq=orig_freq,
                 new_freq=TARGET_SR
             ).to(self.device)
         return self.resamplers[orig_freq]
@@ -183,7 +185,10 @@ class DataPreprocessor(Process):
         
         results = []
         for i, p_data in enumerate(processed_datas):
-            results.append((input_data_list[i].file_rel_path, p_data))
+            if input_data_list[i].speaker_id is not None:
+                results.append((input_data_list[i].file_rel_path, input_data_list[i].speaker_id, p_data))
+            else:
+                results.append((input_data_list[i].file_rel_path, p_data))
         return results
 
     def get_emb(self, input_features, attention_mask):

@@ -15,8 +15,9 @@ sys.path.append(root_dir)
 from trainers.utils import ProcessedData
 
 # ================= 配置区域 =================
-SOURCE_DIR = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
-TARGET_DIR = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload_arrow"
+SOURCE_NAME = "Galgame-VisualNovel-Reupload"
+SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{SOURCE_NAME}"
+TARGET_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/final_train_data/{SOURCE_NAME}_arrow"
 SHARD_SIZE = 20000  # 每个分片包含的数据量
 MIN_DURATION = 8
 
@@ -38,7 +39,7 @@ def save_shard(data_buffer, shard_index, output_dir):
         return
 
     # 创建保存目录
-    save_path = os.path.join(output_dir, f"part_{shard_index}")
+    save_path = os.path.join(output_dir, f"{SOURCE_NAME}_part_{shard_index}")
     os.makedirs(save_path, exist_ok=True)
     
     # 从字典创建 Dataset (列式存储创建速度最快)

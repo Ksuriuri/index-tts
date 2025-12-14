@@ -74,7 +74,7 @@ class ArrowJapaneseGPTDataset(Dataset):
     def __init__(self, arrow_root_dir: str):
         """
         Args:
-            arrow_root_dir: 包含 part_0, part_1... 的根目录路径
+            arrow_root_dir: 包含 xxx_part_0, xxx_part_1... 的根目录路径
         """
         self.arrow_root_dir = Path(arrow_root_dir)
         
@@ -82,7 +82,7 @@ class ArrowJapaneseGPTDataset(Dataset):
         print(f"[Dataset] Scanning shards in {self.arrow_root_dir} ...")
         shard_paths = sorted([
             d for d in self.arrow_root_dir.iterdir() 
-            if d.is_dir() and d.name.startswith("part_")
+            if d.is_dir() and "_part_" in d.name
         ], key=lambda x: int(x.name.split("_")[-1])) # 按 part_后面的数字排序
 
         if not shard_paths:
