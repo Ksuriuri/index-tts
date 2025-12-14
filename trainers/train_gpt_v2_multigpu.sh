@@ -6,7 +6,9 @@ accelerate launch \
     --config checkpoints/IndexTTS-2-vLLM/config.yaml \
     --tokenizer checkpoints/IndexTTS-2-vLLM/jp_bpe.model \
     --base-checkpoint checkpoints/IndexTTS-2-vLLM/gpt.pth \
-    --train-data-dir /mnt/data_3t_2/datasets/indextts_train_data/Gacha_games_jp_arrow \
+    --train-data-dir \
+    /mnt/data_3t_2/datasets/indextts_train_data/final_train_data/Gacha_games_jp_arrow \
+    /mnt/data_3t_2/datasets/indextts_train_data/final_train_data/Emilia-YODAS-JA_arrow \
     --val-data-size 128 \
     --output-dir ./trained_ckpts \
     --batch-size-per-device 4 \

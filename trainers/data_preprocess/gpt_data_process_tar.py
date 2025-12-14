@@ -36,9 +36,10 @@ sys.path.append(root_dir)
 from trainers.data_preprocess.gpt_data_process_worker import DataPreprocessor, DataPreprocessorReqData
 
 random.seed(42)
-# 修改为实际的输入输出路径
-DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Emilia-YODAS/JA" 
-OUTPUT_DIR = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia-YODAS/JA"
+# DATASET_NAME = "Emilia-YODAS"
+DATASET_NAME = "Emilia"
+DATASET_ROOT = f"/mnt/data_3t_1/datasets/raw_data/{DATASET_NAME}/JA" 
+OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{DATASET_NAME}/JA"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 1   # Tar解压和解码比较耗CPU，可以适当增加

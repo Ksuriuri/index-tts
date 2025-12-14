@@ -37,7 +37,13 @@ from trainers.utils import ProcessedData
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Finetune IndexTTS2 GPT on Japanese data.")
-    parser.add_argument("--train-data-dir", type=str, required=True, help="Path to the arrow dataset directory (containing part_*)")
+    parser.add_argument(
+        "--train-data-dirs", 
+        type=str, 
+        nargs='+',  # 接收一个或多个值
+        required=True, 
+        help="Path to the arrow dataset directories (containing part_*), can specify multiple"
+    )
     parser.add_argument("--val-data-size", type=int, default=128, help="Validation data size.")
     parser.add_argument("--tokenizer", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/jp_bpe.model"), help="SentencePiece model path.")
     parser.add_argument("--config", type=Path, default=Path("checkpoints/IndexTTS-2-vLLM/config.yaml"), help="Model config YAML.")
@@ -71,26 +77,30 @@ def parse_args() -> argparse.Namespace:
 
 
 class ArrowJapaneseGPTDataset(Dataset):
-    def __init__(self, arrow_root_dir: str):
+    def __init__(self, arrow_root_dirs: List[str]):
         """
         Args:
             arrow_root_dir: 包含 xxx_part_0, xxx_part_1... 的根目录路径
         """
-        self.arrow_root_dir = Path(arrow_root_dir)
-        
-        # 1. 扫描所有分片目录
-        print(f"[Dataset] Scanning shards in {self.arrow_root_dir} ...")
-        shard_paths = sorted([
-            d for d in self.arrow_root_dir.iterdir() 
-            if d.is_dir() and "_part_" in d.name
-        ], key=lambda x: int(x.name.split("_")[-1])) # 按 part_后面的数字排序
+        all_shard_paths = []
+        for arrow_root_dir in arrow_root_dirs:
+            arrow_root_dir = Path(arrow_root_dir)
+            
+            # 1. 扫描所有分片目录
+            print(f"[Dataset] Scanning shards in {arrow_root_dir} ...")
+            shard_paths = sorted([
+                d for d in arrow_root_dir.iterdir() 
+                if d.is_dir() and "_part_" in d.name
+            ], key=lambda x: int(x.name.split("_")[-1])) # 按 part_后面的数字排序
 
-        if not shard_paths:
-            raise ValueError(f"No 'part_*' directories found in {self.arrow_root_dir}")
+            if not shard_paths:
+                raise ValueError(f"No 'part_*' directories found in {arrow_root_dir}")
+            
+            all_shard_paths.extend(shard_paths)
 
         # 2. 加载所有分片 (load_from_disk 是懒加载，速度很快)
         # 注意：这里加载的是 Dataset 对象，还没有读取具体数据
-        datasets = [load_from_disk(str(p)) for p in shard_paths]
+        datasets = [load_from_disk(str(p)) for p in all_shard_paths]
         
         # 3. 逻辑合并 (零拷贝，仅仅是索引合并)
         self.dataset = concatenate_datasets(datasets)
@@ -428,7 +438,7 @@ def main() -> None:
         duration_dropout=args.duration_dropout
     )
 
-    full_dataset = ArrowJapaneseGPTDataset(args.train_data_dir)
+    full_dataset = ArrowJapaneseGPTDataset(args.train_data_dirs)
     total_size = len(full_dataset)
     train_size = total_size - args.val_data_size
     

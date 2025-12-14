@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt  # 引入绘图库
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(root_dir)
 
-from typing import Dict, Union
+from typing import Dict, List, Union
 from concurrent.futures import ProcessPoolExecutor
 import time
 from tqdm import tqdm
@@ -24,17 +24,24 @@ def process_single_file(file_path):
     duration_distribution: Dict[int, int] = {}
     try:
         with open(file_path, 'rb') as f:
-            data_list = pickle.load(f)
+            data_sets = pickle.load(f)
         
-        if isinstance(data_list, list):
-            for item in data_list:
-                if isinstance(item, ProcessedData):
-                    file_duration += item.duration
-                    # 四舍五入取整
-                    d_int = int(item.duration + 0.5)
-                    if d_int not in duration_distribution:
-                        duration_distribution[d_int] = 0
-                    duration_distribution[d_int] += 1
+        data_list: List[ProcessedData] = []
+        if isinstance(data_sets, list):
+            for item in data_sets:
+                data_list.append(item)
+        elif isinstance(data_sets, dict):
+            for sub_data_list in data_sets.values():
+                data_list.extend(sub_data_list)
+
+        for item in data_list:
+            if isinstance(item, ProcessedData):
+                file_duration += item.duration
+                # 四舍五入取整
+                d_int = int(item.duration + 0.5)
+                if d_int not in duration_distribution:
+                    duration_distribution[d_int] = 0
+                duration_distribution[d_int] += 1
             
         return 1, file_duration, duration_distribution  # 成功
         
@@ -49,7 +56,8 @@ def main():
     plt.rcParams['axes.unicode_minus'] = False 
 
     # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
-    target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Gacha_games_jp"
+    # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Gacha_games_jp"
+    target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia/JA"
     
     if not os.path.exists(target_dir):
         print(f"Directory not found: {target_dir}")
