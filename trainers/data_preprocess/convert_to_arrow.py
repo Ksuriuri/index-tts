@@ -15,11 +15,15 @@ sys.path.append(root_dir)
 from trainers.utils import ProcessedData
 
 # ================= 配置区域 =================
-SOURCE_NAME = "Galgame-VisualNovel-Reupload"
+# SOURCE_NAME = "Galgame-VisualNovel-Reupload"
+SOURCE_NAME = "Japanese-Eroge-Voice"
 SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{SOURCE_NAME}"
 TARGET_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/final_train_data/{SOURCE_NAME}_arrow"
 SHARD_SIZE = 20000  # 每个分片包含的数据量
 MIN_DURATION = 0
+MAX_DURATION = 36
+MIN_TEXT_TOKENS = 1
+MAX_TEXT_TOKENS = 600
 
 def get_all_pkl_files(directory):
     """递归查找所有符合条件的pkl文件"""
@@ -84,7 +88,8 @@ def main():
                 continue
 
             for item in data_list:
-                if item.duration < MIN_DURATION:
+                if item.duration < MIN_DURATION or item.duration > MAX_DURATION or \
+                    item.text_len < MIN_TEXT_TOKENS or item.text_len > MAX_TEXT_TOKENS:
                     continue
                 # 确保是 numpy 格式
                 item = item.to_numpy()

@@ -1,4 +1,7 @@
-
+# 快速创建公网访问链接
+```bash
+cloudflared tunnel --url http://127.0.0.1:7860
+```
 
 <div align="center">
 <img src='assets/index_icon.png' width="250"/>

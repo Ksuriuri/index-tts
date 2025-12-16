@@ -15,14 +15,18 @@ sys.path.append(root_dir)
 from trainers.utils import ProcessedData
 
 # ================= 配置区域 =================
-# SOURCE_NAME = "Emilia-YODAS-JA"  # 根据实际情况修改名称
-# SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/Emilia-YODAS/JA" 
+SOURCE_NAME = "Emilia-YODAS-JA"  # 根据实际情况修改名称
+SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/Emilia-YODAS/JA" 
 
-SOURCE_NAME = "Emilia-JA"  # 根据实际情况修改名称
-SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/Emilia/JA" 
+# SOURCE_NAME = "Emilia-JA"  # 根据实际情况修改名称
+# SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/Emilia/JA" 
+
 TARGET_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/final_train_data/{SOURCE_NAME}_arrow"
 SHARD_SIZE = 20000  # 每个分片包含的数据量
 MIN_DURATION = 0
+MAX_DURATION = 36
+MIN_TEXT_TOKENS = 1
+MAX_TEXT_TOKENS = 600
 
 def get_all_pkl_files(directory):
     """递归查找所有符合条件的pkl文件"""
@@ -109,7 +113,7 @@ def main():
                 # 1. 第一遍遍历：筛选有效数据并转换为 numpy
                 valid_items = []
                 for item in data_list:
-                    if item.duration >= MIN_DURATION:
+                    if MAX_DURATION >= item.duration >= MIN_DURATION and MAX_TEXT_TOKENS >= item.text_len >= MIN_TEXT_TOKENS:
                         # 转换为 numpy
                         valid_items.append(item.to_numpy())
                 

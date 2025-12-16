@@ -9,6 +9,8 @@ accelerate launch \
     --train-data-dir \
     /mnt/data_3t_2/datasets/indextts_train_data/final_train_data/Gacha_games_jp_arrow \
     /mnt/data_3t_2/datasets/indextts_train_data/final_train_data/Emilia-YODAS-JA_arrow \
+    /mnt/data_3t_2/datasets/indextts_train_data/final_train_data/Emilia-JA_arrow \
+    /mnt/data_3t_2/datasets/indextts_train_data/final_train_data/Japanese-Eroge-Voice_arrow \
     --val-data-size 128 \
     --output-dir ./trained_ckpts \
     --batch-size-per-device 4 \
@@ -24,4 +26,4 @@ accelerate launch \
     --use-duration-control \
     --duration-dropout 0.3 \
     --wandb-project "IndexTTS2-jp" \
-    --wandb-run-name "20251214-test"
+    --wandb-run-name "20251216-test"

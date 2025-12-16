@@ -20,6 +20,9 @@ SOURCE_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{SOURCE_NAME}"
 TARGET_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/final_train_data/{SOURCE_NAME}_arrow"
 SHARD_SIZE = 20000  # 每个分片包含的数据量
 MIN_DURATION = 0
+MAX_DURATION = 36
+MIN_TEXT_TOKENS = 1
+MAX_TEXT_TOKENS = 600
 
 def get_all_pkl_files(directory):
     """递归查找所有符合条件的pkl文件"""
@@ -103,7 +106,7 @@ def main():
             # 1. 第一遍遍历：筛选有效数据并转换为 numpy
             valid_items = []
             for item in data_list:
-                if item.duration >= MIN_DURATION:
+                if MAX_DURATION >= item.duration >= MIN_DURATION and MAX_TEXT_TOKENS >= item.text_len >= MIN_TEXT_TOKENS:
                     # 在这里直接转 numpy，方便后续处理
                     valid_items.append(item.to_numpy())
             

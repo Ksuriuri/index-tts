@@ -9,7 +9,7 @@ import time
 import traceback
 import json
 import tarfile
-from typing import Dict, List, Optional
+from typing import Dict, List
 import uuid
 import numpy as np
 from tqdm import tqdm
@@ -32,23 +32,23 @@ mp.set_sharing_strategy('file_system')
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(root_dir)
 
+# 请确保 gpt_data_process_worker.py 已经应用了上面的修改
 from trainers.data_preprocess.gpt_data_process_worker import DataPreprocessor, DataPreprocessorReqData
 
 random.seed(42)
-
-# ================= 配置修改区域 =================
-DATASET_NAME = "Japanese-Eroge-Voice"
-DATASET_ROOT = f"/mnt/data_3t_1/datasets/raw_data/{DATASET_NAME}" 
-OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{DATASET_NAME}"
+# DATASET_NAME = "Emilia-YODAS"
+DATASET_NAME = "Emilia"
+DATASET_ROOT = f"/mnt/data_3t_1/datasets/raw_data/{DATASET_NAME}/JA" 
+OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data/{DATASET_NAME}/JA"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
 TARGET_SR = 16000
-CPU_WORKERS_NUM = 1
+CPU_WORKERS_NUM = 1   # Tar解压和解码比较耗CPU，可以适当增加
 DEVICE_NUM = 8
 PROCESSORS_PER_DEVICE = 1
 MAX_GPU_TASK_QUEUE_SIZE = 32
 MAX_AUDIO_DURATION = 36
 BATCH_SIZE = 12
-# ===============================================
+
 
 @dataclass
 class FileManifest:
@@ -85,7 +85,6 @@ class AudioLoaderWorker(Process):
                 output_rel_path = rel_path.replace(".tar", ".pkl")
                 output_path = os.path.join(OUTPUT_DIR, output_rel_path)
                 
-                # 跳过已存在
                 if os.path.exists(output_path):
                     logger.info(f"[CPU-Loader-{self.worker_id}] Skipping {rel_path} as it already exists.")
                     continue
@@ -95,8 +94,8 @@ class AudioLoaderWorker(Process):
                 non_audio_or_text_skip_num = 0
                 pf_start_time = time.time()
                 
-                # 缓冲区，用于配对 key.txt 和 key.flac/wav/mp3
-                # 结构: { "file_key": {"text": str, "audio": bytes} }
+                # 缓冲区，用于配对 key.json 和 key.mp3
+                # 结构: { "file_key": {"json": {...}, "audio": bytes} }
                 sample_buffer = {}
                 
                 pbar = tqdm(desc=f"CPU-Loader-{self.worker_id}: {os.path.basename(tar_path)}")
@@ -109,12 +108,11 @@ class AudioLoaderWorker(Process):
                                 continue
                             
                             file_name = os.path.basename(member.name)
-                            # 根据数据集描述，通常是 key.txt 和 key.flac
+                            # Emilia 数据集通常结构: key.json, key.mp3
                             key, ext = os.path.splitext(file_name)
-                            ext = ext.lower()
                             
                             # 过滤掉非目标文件
-                            if ext not in ['.txt', '.flac']:
+                            if ext not in ['.json', '.mp3']:
                                 continue
                                 
                             if key not in sample_buffer:
@@ -124,29 +122,25 @@ class AudioLoaderWorker(Process):
                                 f = tar.extractfile(member)
                                 if f is None: continue
                                 
-                                if ext == '.txt':
-                                    # 读取文本，注意编码
-                                    content_bytes = f.read()
-                                    try:
-                                        text_content = content_bytes.decode('utf-8').strip()
-                                        sample_buffer[key]['text'] = text_content
-                                    except UnicodeDecodeError:
-                                        logger.warning(f"Decode error in {file_name}")
-                                        pass
-
-                                elif ext in ['.flac']:
+                                if ext == '.json':
+                                    content = json.load(f)
+                                    sample_buffer[key]['json'] = content
+                                elif ext == '.mp3':
                                     sample_buffer[key]['audio'] = f.read()
                             except Exception as e:
                                 logger.warning(f"Error reading member {file_name}: {e}")
                                 del sample_buffer[key]
                                 continue
 
-                            # 检查是否凑齐了一对 (txt + audio)
-                            if 'text' in sample_buffer[key] and 'audio' in sample_buffer[key]:
+                            # 检查是否凑齐了一对
+                            if 'json' in sample_buffer[key] and 'audio' in sample_buffer[key]:
                                 data_item = sample_buffer.pop(key) # 取出并从 buffer 删除
                                 
-                                text = data_item['text']
+                                json_data = data_item['json']
                                 audio_bytes = data_item['audio']
+                                
+                                text = json_data.get('text', "")
+                                speaker = json_data.get('speaker', uuid.uuid4().hex)
                                 
                                 if not text or not audio_bytes:
                                     non_audio_or_text_skip_num += 1
@@ -172,6 +166,7 @@ class AudioLoaderWorker(Process):
                                         audio=array, 
                                         orig_sr=sampling_rate,
                                         file_rel_path=output_rel_path, # 使用计算好的输出路径标识
+                                        speaker_id=speaker             # 传递 speaker
                                     )
                                     batch_req.append(req)
                                     valid_count += 1
@@ -199,6 +194,7 @@ class AudioLoaderWorker(Process):
                     batch_req = []
                 
                 # 发送清单给 Writer
+                # 注意：如果没有任何有效数据，也建议发送一个 count=0 的 manifest 以便 Writer 能够标记该文件结束
                 manifest = FileManifest(
                     file_rel_path=output_rel_path,
                     total_samples=valid_count,
@@ -221,8 +217,7 @@ class ResultWriterWorker(Process):
         logger.info("[Writer] Started.")
         
         # Buffer结构修改：
-        # 适应无Speaker的情况，直接存列表
-        # { file_rel_path: {'expected': int, 'data': List[ProcessedData], 'received': int} }
+        # { file_rel_path: {'expected': int, 'data': Dict[speaker_id, List[ProcessedData]], 'received': int} }
         self.file_buffers = {}
         finished_files_count = 0
         
@@ -239,7 +234,7 @@ class ResultWriterWorker(Process):
                         # 如果还没收到任何数据
                         self.file_buffers[file_key] = {
                             'expected': manifest.total_samples,
-                            'data': [],  # 修改点：初始化为列表
+                            'data': {},  # 改为字典
                             'received': 0,
                         }
                     else:
@@ -257,24 +252,29 @@ class ResultWriterWorker(Process):
 
             # 2. 接收处理结果
             try:
+                # 获取结果: List[(file_rel_path, speaker_id, processed_data)]
                 res = self.result_queue.get(timeout=0.1)
                 for res_item in res:
-                    file_rel_path, processed_data = res_item
+                    file_rel_path, speaker_id, processed_data = res_item
                     
                     if file_rel_path not in self.file_buffers:
                         self.file_buffers[file_rel_path] = {
                             'expected': -1, 
-                            'data': [],
+                            'data': {}, # 改为字典
                             'received': 0,
                         }
                     
                     buffer_entry = self.file_buffers[file_rel_path]
                     
-                    buffer_entry['data'].append(processed_data)
+                    # 按 Speaker 归类
+                    if speaker_id not in buffer_entry['data']:
+                        buffer_entry['data'][speaker_id] = []
+                    buffer_entry['data'][speaker_id].append(processed_data)
                     
                     buffer_entry['received'] += 1
                     
                     # 检查是否完成
+                    # 稍微放宽条件 (0.95) 防止偶尔丢包导致死锁，或者依靠超时机制
                     if buffer_entry['expected'] != -1 and buffer_entry['received'] >= buffer_entry['expected'] * 0.95:
                         self._finish_file(file_rel_path, pbar)
                         finished_files_count += 1
@@ -296,18 +296,19 @@ class ResultWriterWorker(Process):
                 self.save_file(file_rel_path, buf['data'])
             finally:
                 del self.file_buffers[file_rel_path]
+                # 这里不增加 finished_files_count，在调用处增加
                 pbar.update(1)
 
-    def save_file(self, rel_path, data_list):
+    def save_file(self, rel_path, data_dict):
         """
-        data_list: List[ProcessedData] (修改点：参数类型变了)
+        data_dict: Dict[speaker_id, List[ProcessedData]]
         """            
         output_path = os.path.join(OUTPUT_DIR, rel_path)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         try:
-            # 直接保存列表
+            # 直接保存字典
             with open(output_path, "wb") as f:
-                pickle.dump(data_list, f)
+                pickle.dump(data_dict, f)
         except Exception as e:
             logger.error(f"Failed to save {output_path}: {traceback.format_exc()}")
 
@@ -320,6 +321,8 @@ def main():
     # 1. 扫描文件 (扫描 .tar)
     logger.info("Scanning .tar files...")
     all_tar_files = []
+    # 如果数据在 root 下有子文件夹结构，用 scandir 递归或者 glob
+    # 假设结构是 DATASET_ROOT/*.tar 或者 DATASET_ROOT/*/*.tar
     
     # 递归搜索所有 .tar 文件
     for root, dirs, files in os.walk(DATASET_ROOT):

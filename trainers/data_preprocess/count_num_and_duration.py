@@ -57,7 +57,9 @@ def main():
 
     # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Galgame-VisualNovel-Reupload"
     # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Gacha_games_jp"
-    target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia/JA"
+    # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia-YODAS/JA"
+    # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia/JA"
+    target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Japanese-Eroge-Voice"
     
     if not os.path.exists(target_dir):
         print(f"Directory not found: {target_dir}")
@@ -159,6 +161,7 @@ if __name__ == "__main__":
 
 
 
+# Galgame-VisualNovel-Reupload
 # ========================================
 # final_distribution:  {6: 687085, 9: 316329, 7: 556328, 4: 937028, 5: 817985, 3: 946003, 2: 856137, 10: 226448, 1: 686886, 13: 73858, 8: 429961, 15: 32520, 11: 158027, 12: 108155, 14: 48928, 17: 14071, 18: 9164, 16: 21370, 0: 37674, 25: 486, 19: 6034, 20: 3772, 22: 1691, 21: 2497, 24: 761, 27: 216, 28: 185, 26: 353, 23: 1141, 29: 100, 30: 72, 34: 24, 31: 53, 36: 5, 32: 32, 35: 18, 33: 20}
 # Generating Plot...
@@ -175,7 +178,7 @@ if __name__ == "__main__":
 
 
 
-
+# Gacha_games_jp
 # ========================================
 # final_distribution:  {3: 18799, 1: 8911, 9: 12426, 4: 21295, 8: 14825, 7: 16893, 13: 5148, 5: 20747, 6: 19265, 11: 8636, 2: 14597, 12: 6661, 10: 10594, 15: 3017, 16: 2268, 14: 4003, 18: 1307, 19: 981, 0: 779, 24: 322, 20: 760, 23: 357, 17: 1590, 31: 87, 27: 164, 30: 91, 22: 449, 26: 197, 34: 61, 29: 124, 36: 26, 25: 294, 35: 55, 33: 77, 32: 88, 21: 583, 28: 170}
 # Generating Plot...
@@ -188,4 +191,55 @@ if __name__ == "__main__":
 # Total Duration (Seconds): 1395921.67 s
 # Total Duration (Minutes): 23265.36 min
 # Total Duration (Hours)  : 387.76 hours
+# ========================================
+
+
+
+# Emilia-YODAS
+# ========================================
+# final_distribution:  {9: 28728, 4: 56119, 11: 19881, 8: 34816, 12: 16866, 10: 24362, 5: 49975, 7: 40734, 13: 14064, 6: 47238, 3: 32946, 17: 8072, 16: 9102, 18: 7106, 14: 11992, 20: 4601, 24: 1425, 19: 6409, 23: 1759, 21: 2779, 28: 1427, 29: 1796, 27: 1034, 26: 1067, 15: 10220, 22: 2300, 30: 2545, 25: 1175}
+# Generating Plot...
+# Plot saved to: /mnt/data_sdd/hhy/index-tts/duration_distribution.png
+
+# ========================================
+# Processing Complete
+# ========================================
+# Processed Files: 30 / 30
+# Total Duration (Seconds): 3911871.80 s
+# Total Duration (Minutes): 65197.86 min
+# Total Duration (Hours)  : 1086.63 hours
+# ========================================
+
+
+
+# Emilia
+# ========================================
+# final_distribution:  {4: 179884, 6: 90133, 3: 124567, 5: 125604, 10: 30275, 7: 65672, 11: 23688, 12: 19367, 8: 50360, 9: 39159, 18: 7032, 17: 8089, 14: 12878, 24: 1640, 16: 9343, 26: 1204, 28: 2252, 29: 2985, 15: 11016, 23: 1982, 21: 3106, 19: 6352, 27: 1470, 30: 2569, 20: 4729, 25: 1405, 22: 2531, 13: 15560}
+# Generating Plot...
+# Plot saved to: /mnt/data_sdd/hhy/index-tts/duration_distribution.png
+
+# ========================================
+# Processing Complete
+# ========================================
+# Processed Files: 70 / 70
+# Total Duration (Seconds): 5998450.19 s
+# Total Duration (Minutes): 99974.17 min
+# Total Duration (Hours)  : 1666.24 hours
+# ========================================
+
+
+
+# Japanese-Eroge-Voice
+# ========================================
+# final_distribution:  {7: 20362, 2: 14925, 12: 6257, 14: 3083, 1: 11360, 3: 19808, 5: 24498, 8: 17196, 11: 8619, 4: 24318, 9: 14396, 6: 22362, 10: 11713, 29: 126, 0: 317, 13: 4363, 15: 2109, 19: 560, 16: 1503, 18: 742, 30: 151, 24: 157, 17: 978, 26: 79, 20: 509, 23: 187, 22: 253, 27: 77, 21: 368, 25: 108, 28: 74}
+# Generating Plot...
+# Plot saved to: /mnt/data_sdd/hhy/index-tts/duration_distribution.png
+
+# ========================================
+# Processing Complete
+# ========================================
+# Processed Files: 218 / 218
+# Total Duration (Seconds): 1396023.57 s
+# Total Duration (Minutes): 23267.06 min
+# Total Duration (Hours)  : 387.78 hours
 # ========================================
