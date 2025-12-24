@@ -6,12 +6,12 @@ import numpy as np
 
 @dataclass
 class ProcessedData:
-    text_ids: Union[torch.Tensor, np.ndarray]  # int16, [text_len]
-    codes: Union[torch.Tensor, np.ndarray]     # int16, [code_len]
+    text_ids: np.ndarray  # int16, [text_len]
+    codes: np.ndarray     # int16, [code_len]
     text_len: int
     code_len: int
-    condition: Union[torch.Tensor, np.ndarray] # float16, [32, 1280]
-    emo_vec: Union[torch.Tensor, np.ndarray]   # float16, [1280]
+    condition: np.ndarray # float16, [32, 1280]
+    emo_vec: np.ndarray   # float16, [1280]
     duration: float
 
     def to_numpy(self):
