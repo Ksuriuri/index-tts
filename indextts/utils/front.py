@@ -565,9 +565,14 @@ class TextTokenizer:
                     "Maybe unexpected behavior",
                     RuntimeWarning,
                 )
-            segments.extend(sub_segments)
-            current_segment = []
-            current_segment_tokens_len = 0
+            if len(sub_sentences) > 0:
+                sentences.extend(sub_sentences[:-1])
+                # 将最后一个片段作为新的当前句子继续累积，否则会被单独作为一个片段（很可能是不完整的）
+                current_sentence = sub_sentences[-1]
+                current_sentence_tokens_len = len(current_sentence)
+            else:
+                current_sentence = []
+                current_sentence_tokens_len = 0
         if current_segment_tokens_len > 0:
             assert current_segment_tokens_len <= max_text_tokens_per_segment
             segments.append(current_segment)
