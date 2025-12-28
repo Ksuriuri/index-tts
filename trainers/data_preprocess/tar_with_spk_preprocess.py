@@ -6,6 +6,9 @@ import glob
 import queue
 import time
 import json
+import tarfile
+import traceback
+import uuid
 from dataclasses import dataclass
 from typing import List, Dict, Any, Set
 
@@ -32,8 +35,10 @@ except RuntimeError:
     pass
 
 # --- 配置 ---
-DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Galgame-VisualNovel-Reupload"
-OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/Galgame-VisualNovel-Reupload"
+DATASET_NAME = "Emilia-YODAS"
+# DATASET_NAME = "Emilia"
+DATASET_ROOT = f"/mnt/data_3t_1/datasets/raw_data/{DATASET_NAME}/JA" 
+OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}_JA"
 CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json") 
 
 WHISPER_MODEL_SIZE = "large-v3"
@@ -48,9 +53,10 @@ MAX_AUDIO_DURATION = -1  # 36
 @dataclass
 class ASRTask:
     audio_bytes: bytes
-    audio_raw: np.ndarray  # 传输时将使用 float16
+    audio_raw: np.ndarray  # float16
     sample_rate: int       
     text_gt: str
+    speaker: str           # 新增 speaker 字段
     source_file: str  
 
 class AudioLoaderWorker(Process):
@@ -65,75 +71,122 @@ class AudioLoaderWorker(Process):
     def run(self):
         logger.info(f"[CPU-Loader-{self.worker_id}] Started.")
         current_batch = []
+        
+        # 支持的音频后缀
+        AUDIO_EXTS = ['.mp3', '.wav', '.flac', '.ogg']
 
         while True:
             try:
-                parquet_path = self.file_queue.get(timeout=10)
+                tar_path = self.file_queue.get(timeout=10)
             except queue.Empty:
                 break
             
-            if parquet_path is None: break
+            if tar_path is None: break
 
             try:
-                skip_count = self.checkpoint.get(parquet_path, 0)
+                # 获取该文件已处理的样本数 (断点续传)
+                skip_count = self.checkpoint.get(tar_path, 0)
                 if skip_count > 0:
-                    logger.info(f"[Loader-{self.worker_id}] {parquet_path} resuming from index {skip_count}")
+                    logger.info(f"[Loader-{self.worker_id}] {os.path.basename(tar_path)} resuming, skipping first {skip_count} samples")
 
-                parquet_file = pq.ParquetFile(parquet_path)
-                rows_read = 0
+                # 缓冲区，用于配对 key.json 和 key.mp3/wav
+                sample_buffer = {}
+                processed_count = 0 # 当前文件已提取的有效样本计数
                 
-                for batch_data in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text']):
-                    batch_len = len(batch_data)
-                    if rows_read + batch_len <= skip_count:
-                        rows_read += batch_len
-                        continue
-                    
-                    audio_col = batch_data['audio']
-                    text_col = batch_data['text']
-                    
-                    for i in range(len(batch_data)):
-                        current_row_idx = rows_read + i
-                        if current_row_idx < skip_count:
+                with tarfile.open(tar_path, "r") as tar:
+                    for member in tar:
+                        if not member.isfile():
+                            continue
+                        
+                        file_name = os.path.basename(member.name)
+                        if file_name.startswith("._"): continue # 跳过 Mac 系统缓存文件
+
+                        key, ext = os.path.splitext(file_name)
+                        
+                        # 简单的过滤
+                        if ext not in ['.json'] and ext not in AUDIO_EXTS:
                             continue
 
+                        if key not in sample_buffer:
+                            sample_buffer[key] = {}
+                        
                         try:
-                            text = str(text_col[i])
-                            audio_struct = audio_col[i].as_py()
-                            audio_bytes = audio_struct['bytes']
-                            if not audio_bytes or not text: continue
-
-                            with io.BytesIO(audio_bytes) as f:
-                                array, sr = sf.read(f)
+                            f = tar.extractfile(member)
+                            if f is None: continue
                             
-                            if MAX_AUDIO_DURATION > 0 and len(array) / sr > MAX_AUDIO_DURATION: continue
-                            if array.ndim > 1: array = np.mean(array, axis=1)
-                            
-                            task = ASRTask(
-                                audio_bytes=audio_bytes, 
-                                audio_raw=array.astype(np.float16), 
-                                sample_rate=sr, 
-                                text_gt=text,
-                                source_file=parquet_path
-                            )
-                            current_batch.append(task)
-
-                            if len(current_batch) >= BATCH_SIZE:
-                                self.gpu_task_queue.put(current_batch)
-                                current_batch = []
-                        except Exception:
+                            if ext == '.json':
+                                try:
+                                    content = json.load(f)
+                                    sample_buffer[key]['json'] = content
+                                except:
+                                    pass # JSON解析失败忽略
+                            elif ext in AUDIO_EXTS:
+                                sample_buffer[key]['audio'] = f.read()
+                        except Exception as e:
+                            # 读取错误则清理 buffer
+                            if key in sample_buffer: del sample_buffer[key]
                             continue
-                    
-                    rows_read += batch_len
+                        
+                        # 检查是否凑齐了一对 (Audio + Json)
+                        if 'json' in sample_buffer[key] and 'audio' in sample_buffer[key]:
+                            data_item = sample_buffer.pop(key)
+                            
+                            # 断点续传逻辑：如果还没达到 skip_count，直接跳过处理
+                            if processed_count < skip_count:
+                                processed_count += 1
+                                continue
+                            
+                            json_data = data_item['json']
+                            audio_bytes = data_item['audio']
+                            
+                            text = json_data.get('text', "")
+                            # 获取 speaker，如果没有则用 None
+                            speaker = json_data.get('speaker', None) 
+                            
+                            if not text or not audio_bytes: 
+                                continue
+
+                            try:
+                                # 转换音频
+                                with io.BytesIO(audio_bytes) as audio_io:
+                                    array, sr = sf.read(audio_io)
+                                
+                                # 检查时长
+                                if MAX_AUDIO_DURATION > 0 and len(array) / sr > MAX_AUDIO_DURATION: 
+                                    continue
+                                
+                                # 转单声道
+                                if array.ndim > 1: array = np.mean(array, axis=1)
+                                
+                                task = ASRTask(
+                                    audio_bytes=audio_bytes, 
+                                    audio_raw=array.astype(np.float16), 
+                                    sample_rate=sr, 
+                                    text_gt=str(text),
+                                    speaker=str(speaker) if speaker is not None else None,
+                                    source_file=tar_path
+                                )
+                                current_batch.append(task)
+                                processed_count += 1
+
+                                if len(current_batch) >= BATCH_SIZE:
+                                    self.gpu_task_queue.put(current_batch)
+                                    current_batch = []
+                                    
+                            except Exception as e:
+                                # 音频处理出错，跳过
+                                continue
                 
-                # 文件处理完后，更新进度条计数器
+                # 文件处理完后，更新文件进度条
                 with self.file_pbar_counter.get_lock():
                     self.file_pbar_counter.value += 1
                 
-                logger.info(f"[Loader-{self.worker_id}] Finished {os.path.basename(parquet_path)}")
+                logger.info(f"[Loader-{self.worker_id}] Finished {os.path.basename(tar_path)}. Total extracted: {processed_count}")
 
             except Exception as e:
-                logger.error(f"Error loading {parquet_path}: {e}")
+                logger.error(f"Error loading {tar_path}: {traceback.format_exc()}")
         
+        # 处理剩余的 batch
         if current_batch:
             self.gpu_task_queue.put(current_batch)
         logger.info(f"[CPU-Loader-{self.worker_id}] Finished.")
@@ -149,7 +202,12 @@ class GPUASRWorker(Process):
     def run(self):
         device_str = f"cuda:{self.gpu_id}"
         logger.info(f"[GPU-Worker-{self.worker_id}] Loading model on {device_str}...")
-        model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", device_index=self.gpu_id, compute_type=COMPUTE_TYPE)
+        try:
+            model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", device_index=self.gpu_id, compute_type=COMPUTE_TYPE)
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+            return
+
         resamplers = {}
 
         while True:
@@ -181,7 +239,7 @@ class GPUASRWorker(Process):
                     self.output_queue.put({
                         "audio": {"bytes": task.audio_bytes},
                         "text": task.text_gt,
-                        "speaker": None,
+                        "speaker": task.speaker, # 传递 speaker
                         "whisper_large_v3": {
                             "text": text_pred,
                             "cer": float(error_rate),
@@ -205,10 +263,21 @@ class ParquetWriterWorker(Process):
     def run(self):
         os.makedirs(self.output_dir, exist_ok=True)
         buffer = []
+        # 记录当前 batch 中每个源文件贡献了多少条数据
         current_cycle_counts = {} 
         
         existing_parts = glob.glob(os.path.join(self.output_dir, "part_*.parquet"))
-        file_idx = max([int(os.path.basename(f).split('_')[1].split('.')[0]) for f in existing_parts]) + 1 if existing_parts else 0
+        if existing_parts:
+            # 简单的文件序号递增
+            indices = []
+            for f in existing_parts:
+                try:
+                    idx = int(os.path.basename(f).split('_')[1].split('.')[0])
+                    indices.append(idx)
+                except: pass
+            file_idx = max(indices) + 1 if indices else 0
+        else:
+            file_idx = 0
         
         # 样本进度条
         pbar = tqdm(desc="Samples Processed", unit="audios", dynamic_ncols=True)
@@ -264,17 +333,20 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     checkpoint = load_checkpoint()
     
-    all_parquet_files = sorted(glob.glob(os.path.join(DATASET_ROOT, "**/*.parquet"), recursive=True))
-    total_files = len(all_parquet_files)
+    # 修改：扫描 .tar 文件
+    logger.info(f"Scanning .tar files in {DATASET_ROOT}...")
+    all_tar_files = sorted(glob.glob(os.path.join(DATASET_ROOT, "**/*.tar"), recursive=True))
+    total_files = len(all_tar_files)
+    logger.info(f"Found {total_files} tar files.")
     
     file_queue = Queue()
-    for f in all_parquet_files:
+    for f in all_tar_files:
         file_queue.put(f)
     
-    # 共享变量用于更新文件进度条
     file_pbar_counter = Value('i', 0)
     
-    gpu_task_queue = Queue(maxsize=DEVICE_NUM * 16) 
+    # 适当增大队列
+    gpu_task_queue = Queue(maxsize=DEVICE_NUM * 24) 
     result_queue = Queue()
 
     # 启动 Writer
@@ -305,13 +377,16 @@ def main():
                 fbar.update(curr_val - last_val)
                 last_val = curr_val
             time.sleep(1)
-        # 最后补齐
-        fbar.update(total_files - last_val)
+        fbar.update(file_pbar_counter.value - last_val)
 
     # 等待完成并清理
     for p in cpu_workers: p.join()
+    logger.info("CPU Loaders finished.")
+    
     for _ in gpu_workers: gpu_task_queue.put(None)
     for p in gpu_workers: p.join()
+    logger.info("GPU Workers finished.")
+    
     result_queue.put("DONE")
     writer.join()
 

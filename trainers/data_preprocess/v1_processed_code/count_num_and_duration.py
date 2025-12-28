@@ -60,6 +60,8 @@ def main():
     # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia-YODAS/JA"
     # target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Emilia/JA"
     target_dir = "/mnt/data_3t_2/datasets/indextts_train_data/Japanese-Eroge-Voice"
+
+    save_name = "outputs/duration_distribution.png"
     
     if not os.path.exists(target_dir):
         print(f"Directory not found: {target_dir}")
@@ -130,8 +132,6 @@ def main():
         # for a, b in zip(sorted_durations, counts):
         #     plt.text(a, b, str(b), ha='center', va='bottom', fontsize=8)
 
-        # 保存图片到当前目录
-        save_name = "duration_distribution.png"
         plt.savefig(save_name)
         print(f"Plot saved to: {os.path.abspath(save_name)}")
         

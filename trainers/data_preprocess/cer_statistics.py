@@ -8,8 +8,9 @@ from tqdm import tqdm
 
 # --- 配置 ---
 # 这里填写你原来脚本中的 OUTPUT_DIR
-DATASET_DIR = "/mnt/data_3t_1/datasets/preprocess/Galgame-VisualNovel-Reupload"
-PLOT_OUTPUT_PATH = "cer_distribution.png"  # 输出图片路径
+# DATASET_DIR = "/mnt/data_3t_1/datasets/preprocess/Galgame-VisualNovel-Reupload"
+DATASET_DIR = "/mnt/data_3t_1/datasets/preprocess/Gacha_games_jp"
+PLOT_OUTPUT_PATH = "outputs/cer_distribution_Gacha_games.png"  # 输出图片路径
 
 def load_cer_data(data_dir):
     """
