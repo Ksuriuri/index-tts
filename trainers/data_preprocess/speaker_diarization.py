@@ -84,8 +84,6 @@ class DiarizationWorker(Process):
                     continue
 
                 diarization_results = []
-                temp_dir = "/dev/shm" if os.path.exists("/dev/shm") else None
-                # temp_dir = "/mnt/data_sdd/hhy/index-tts/outputs/temp"
                 
                 # --- 为当前文件创建一个进度条 ---
                 # position=self.worker_id + 1 确保每个 worker 占一行，不与全局进度条(position 0)重叠
@@ -106,20 +104,22 @@ class DiarizationWorker(Process):
                         continue
 
                     try:
-                        with tempfile.NamedTemporaryFile(suffix=".wav", dir=temp_dir, delete=True) as tmp_wav:
-                            tmp_wav.write(audio_bytes)
-                            tmp_wav.flush()
-                            
-                            diarization = pipeline(tmp_wav.name)
-                            
-                            segments = []
-                            for turn, speaker in diarization.speaker_diarization:
-                                segments.append({
-                                    "start": round(turn.start, 3),
-                                    "end": round(turn.end, 3),
-                                    "speaker": speaker
-                                })
-                            diarization_results.append(segments)
+                        audio_stream = io.BytesIO(audio_bytes)
+                        waveform, sample_rate = torchaudio.load(audio_stream)
+                        audio_input = {
+                            "waveform": waveform, 
+                            "sample_rate": sample_rate
+                        }
+                        diarization = pipeline(audio_input)
+                        
+                        segments = []
+                        for turn, speaker in diarization.speaker_diarization:
+                            segments.append({
+                                "start": round(turn.start, 3),
+                                "end": round(turn.end, 3),
+                                "speaker": speaker
+                            })
+                        diarization_results.append(segments)
                     except Exception as e:
                         diarization_results.append([])
                     

@@ -10,8 +10,8 @@ import math
 # DATASET_NAME = "Galgame-VisualNovel-Reupload"
 # DATASET_NAME = "Gacha_games_jp"
 # DATASET_NAME = "Emilia_JA"
-DATASET_NAME = "Emilia-YODAS_JA"
-# DATASET_NAME = "Japanese-Eroge-Voice"
+# DATASET_NAME = "Emilia-YODAS_JA"
+DATASET_NAME = "Japanese-Eroge-Voice"
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 BATCH_SIZE = 1024
 
