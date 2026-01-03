@@ -179,7 +179,7 @@ class GPUASRWorker(Process):
                     error_rate = cer(gt_clean, text_pred) if len(gt_clean) > 0 else 1.0
                     
                     self.output_queue.put({
-                        "audio": {"bytes": task.audio_bytes},
+                        "audio": task.audio_bytes,
                         "text": task.text_gt,
                         "speaker": None,
                         "whisper_large_v3": {

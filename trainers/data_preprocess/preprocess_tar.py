@@ -10,7 +10,7 @@ import tarfile
 import traceback
 import uuid
 from dataclasses import dataclass
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional
 
 import numpy as np
 import torch
@@ -35,11 +35,10 @@ except RuntimeError:
     pass
 
 # --- 配置 ---
-DATASET_NAME = "Emilia-YODAS"
-# DATASET_NAME = "Emilia"
-DATASET_ROOT = f"/mnt/data_3t_1/datasets/raw_data/{DATASET_NAME}/JA" 
-OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}_JA"
-CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json") 
+DATASET_NAME = "Japanese-Eroge-Voice"
+DATASET_ROOT = f"/mnt/data_3t_1/datasets/raw_data/{DATASET_NAME}"
+OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json")
 
 WHISPER_MODEL_SIZE = "large-v3"
 COMPUTE_TYPE = "float16" 
@@ -56,7 +55,7 @@ class ASRTask:
     audio_raw: np.ndarray  # float16
     sample_rate: int       
     text_gt: str
-    speaker: str           # 新增 speaker 字段
+    speaker: Optional[str]
     source_file: str  
 
 class AudioLoaderWorker(Process):
@@ -72,7 +71,6 @@ class AudioLoaderWorker(Process):
         logger.info(f"[CPU-Loader-{self.worker_id}] Started.")
         current_batch = []
         
-        # 支持的音频后缀
         AUDIO_EXTS = ['.mp3', '.wav', '.flac', '.ogg']
 
         while True:
@@ -89,7 +87,7 @@ class AudioLoaderWorker(Process):
                 if skip_count > 0:
                     logger.info(f"[Loader-{self.worker_id}] {os.path.basename(tar_path)} resuming, skipping first {skip_count} samples")
 
-                # 缓冲区，用于配对 key.json 和 key.mp3/wav
+                # 缓冲区，用于配对 key.txt 和 key.mp3/wav/flac
                 sample_buffer = {}
                 processed_count = 0 # 当前文件已提取的有效样本计数
                 
@@ -102,9 +100,10 @@ class AudioLoaderWorker(Process):
                         if file_name.startswith("._"): continue # 跳过 Mac 系统缓存文件
 
                         key, ext = os.path.splitext(file_name)
+                        ext = ext.lower() # 统一小写
                         
-                        # 简单的过滤
-                        if ext not in ['.json'] and ext not in AUDIO_EXTS:
+                        # 修改：过滤逻辑，寻找 .txt 和音频
+                        if ext not in ['.txt'] and ext not in AUDIO_EXTS:
                             continue
 
                         if key not in sample_buffer:
@@ -114,12 +113,14 @@ class AudioLoaderWorker(Process):
                             f = tar.extractfile(member)
                             if f is None: continue
                             
-                            if ext == '.json':
+                            # 修改：处理 .txt 文本文件
+                            if ext == '.txt':
                                 try:
-                                    content = json.load(f)
-                                    sample_buffer[key]['json'] = content
-                                except:
-                                    pass # JSON解析失败忽略
+                                    content_bytes = f.read()
+                                    text_content = content_bytes.decode('utf-8').strip()
+                                    sample_buffer[key]['text'] = text_content
+                                except Exception:
+                                    pass # 文本解析失败忽略
                             elif ext in AUDIO_EXTS:
                                 sample_buffer[key]['audio'] = f.read()
                         except Exception as e:
@@ -127,21 +128,17 @@ class AudioLoaderWorker(Process):
                             if key in sample_buffer: del sample_buffer[key]
                             continue
                         
-                        # 检查是否凑齐了一对 (Audio + Json)
-                        if 'json' in sample_buffer[key] and 'audio' in sample_buffer[key]:
+                        # 修改：检查是否凑齐了一对 (Audio + Text)
+                        if 'text' in sample_buffer[key] and 'audio' in sample_buffer[key]:
                             data_item = sample_buffer.pop(key)
                             
-                            # 断点续传逻辑：如果还没达到 skip_count，直接跳过处理
+                            # 断点续传逻辑
                             if processed_count < skip_count:
                                 processed_count += 1
                                 continue
                             
-                            json_data = data_item['json']
+                            text = data_item['text']
                             audio_bytes = data_item['audio']
-                            
-                            text = json_data.get('text', "")
-                            # 获取 speaker，如果没有则用 None
-                            speaker = json_data.get('speaker', None) 
                             
                             if not text or not audio_bytes: 
                                 continue
@@ -149,7 +146,8 @@ class AudioLoaderWorker(Process):
                             try:
                                 # 转换音频
                                 with io.BytesIO(audio_bytes) as audio_io:
-                                    array, sr = sf.read(audio_io)
+                                    # 注意：sf.read 会返回 float64 或 float32，这里转 float32
+                                    array, sr = sf.read(audio_io, dtype='float32')
                                 
                                 # 检查时长
                                 if MAX_AUDIO_DURATION > 0 and len(array) / sr > MAX_AUDIO_DURATION: 
@@ -163,7 +161,7 @@ class AudioLoaderWorker(Process):
                                     audio_raw=array.astype(np.float16), 
                                     sample_rate=sr, 
                                     text_gt=str(text),
-                                    speaker=str(speaker) if speaker is not None else None,
+                                    speaker=None,
                                     source_file=tar_path
                                 )
                                 current_batch.append(task)
@@ -237,9 +235,9 @@ class GPUASRWorker(Process):
                     error_rate = cer(gt_clean, text_pred) if len(gt_clean) > 0 else 1.0
                     
                     self.output_queue.put({
-                        "audio": {"bytes": task.audio_bytes},
+                        "audio": task.audio_bytes,
                         "text": task.text_gt,
-                        "speaker": task.speaker, # 传递 speaker
+                        "speaker": task.speaker,
                         "whisper_large_v3": {
                             "text": text_pred,
                             "cer": float(error_rate),
@@ -311,6 +309,7 @@ class ParquetWriterWorker(Process):
 
     def _save(self, data_list, idx, cycle_counts):
         save_path = os.path.join(self.output_dir, f"part_{idx:04d}.parquet")
+        # PyArrow/Pandas 自动处理 None 为 Nullable String
         pd.DataFrame(data_list).to_parquet(save_path, engine='pyarrow', index=False)
         
         for src, count in cycle_counts.items():
@@ -333,12 +332,16 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     checkpoint = load_checkpoint()
     
-    # 修改：扫描 .tar 文件
+    # 扫描 .tar 文件
     logger.info(f"Scanning .tar files in {DATASET_ROOT}...")
     all_tar_files = sorted(glob.glob(os.path.join(DATASET_ROOT, "**/*.tar"), recursive=True))
     total_files = len(all_tar_files)
     logger.info(f"Found {total_files} tar files.")
     
+    if total_files == 0:
+        logger.error(f"No .tar files found in {DATASET_ROOT}")
+        return
+
     file_queue = Queue()
     for f in all_tar_files:
         file_queue.put(f)

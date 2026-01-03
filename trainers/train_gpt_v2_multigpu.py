@@ -91,7 +91,7 @@ class ArrowJapaneseGPTDataset(Dataset):
             print(f"[Dataset] Scanning shards in {arrow_root_dir} ...")
             shard_paths = sorted([
                 d for d in arrow_root_dir.iterdir() 
-                if d.is_dir() and "_part_" in d.name
+                if d.is_dir() and "part_" in d.name
             ], key=lambda x: int(x.name.split("_")[-1])) # 按 part_后面的数字排序
 
             if not shard_paths:

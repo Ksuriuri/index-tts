@@ -7,10 +7,14 @@ import seaborn as sns
 from tqdm import tqdm
 
 # --- 配置 ---
-# 这里填写你原来脚本中的 OUTPUT_DIR
-# DATASET_DIR = "/mnt/data_3t_1/datasets/preprocess/Galgame-VisualNovel-Reupload"
-DATASET_DIR = "/mnt/data_3t_1/datasets/preprocess/Gacha_games_jp"
-PLOT_OUTPUT_PATH = "outputs/cer_distribution_Gacha_games.png"  # 输出图片路径
+# DATASET_NAME = "Galgame-VisualNovel-Reupload"
+# DATASET_NAME = "Gacha_games_jp"
+# DATASET_NAME = "Emilia_JA"
+# DATASET_NAME = "Emilia-YODAS_JA"
+DATASET_NAME = "Japanese-Eroge-Voice"
+DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
+
+PLOT_OUTPUT_PATH = f"outputs/cer_distribution_{DATASET_NAME}.png"  # 输出图片路径
 
 def load_cer_data(data_dir):
     """
