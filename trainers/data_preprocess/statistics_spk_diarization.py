@@ -8,9 +8,9 @@ import numpy as np
 
 # --- 配置 (保持与你之前的配置一致) ---
 # DATASET_NAME = "Galgame-VisualNovel-Reupload"
-# DATASET_NAME = "Gacha_games_jp"
+DATASET_NAME = "Gacha_games_jp"
 # DATASET_NAME = "Emilia_JA"
-DATASET_NAME = "Emilia-YODAS_JA"
+# DATASET_NAME = "Emilia-YODAS_JA"
 # DATASET_NAME = "Japanese-Eroge-Voice"
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 OUTPUT_IMG = f"outputs/speaker_distribution_{DATASET_NAME}.png"

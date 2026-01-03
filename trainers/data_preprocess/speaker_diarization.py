@@ -14,20 +14,21 @@ from loguru import logger
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process, Queue, Value
 import soundfile as sf
+import torchaudio.transforms as T
 
 # 引入 Pyannote
 from pyannote.audio import Pipeline
 
 # --- 配置 ---
-# DATASET_NAME = "Galgame-VisualNovel-Reupload"
+DATASET_NAME = "Galgame-VisualNovel-Reupload"
 # DATASET_NAME = "Gacha_games_jp"
 # DATASET_NAME = "Emilia_JA"
-DATASET_NAME = "Emilia-YODAS_JA"
+# DATASET_NAME = "Emilia-YODAS_JA"
 # DATASET_NAME = "Japanese-Eroge-Voice"
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 HF_TOKEN = os.environ.get('HF_TOKEN', None)
 
-DEVICE_NUM = 2
+DEVICE_NUM = 8
 PROCESSORS_PER_DEVICE = 1  
 
 try:
@@ -64,6 +65,9 @@ class DiarizationWorker(Process):
         except Exception as e:
             logger.error(f"[Worker-{self.worker_id}] Failed to load pipeline: {e}")
             return
+    
+        TARGET_SR = 16000
+        resamplers = {} 
 
         while True:
             try:
@@ -106,6 +110,24 @@ class DiarizationWorker(Process):
                     try:
                         audio_stream = io.BytesIO(audio_bytes)
                         waveform, sample_rate = torchaudio.load(audio_stream)
+
+                        waveform = waveform.to(device_str)
+
+                        # 3. 如果是多声道，先转单声道 (Pyannote 只需要单声道，且减少重采样计算量)
+                        if waveform.shape[0] > 1:
+                            waveform = waveform.mean(dim=0, keepdim=True)
+
+                        # 4. GPU 重采样逻辑
+                        if sample_rate != TARGET_SR:
+                            # 检查缓存中是否有对应采样率的重采样器
+                            if sample_rate not in resamplers:
+                                resampler = T.Resample(orig_freq=sample_rate, new_freq=TARGET_SR)
+                                resamplers[sample_rate] = resampler.to(device_str)
+                            
+                            # 执行重采样
+                            waveform = resamplers[sample_rate](waveform)
+                            sample_rate = TARGET_SR
+
                         audio_input = {
                             "waveform": waveform, 
                             "sample_rate": sample_rate
