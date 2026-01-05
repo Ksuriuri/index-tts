@@ -19,7 +19,7 @@ except ImportError:
 
 # --- 配置部分 ---
 MODELSCOPE_CACHE_DIR = r'./outputs'
-MODEL_FILE = r"D:\workspace\index-tts\checkpoints\IndexTTS-2-vLLM\jp_bpe.model"  # 请修改为你的实际路径
+MODEL_FILE = "./checkpoints/IndexTTS-2-vLLM/jp_bpe.model"  # 请修改为你的实际路径
 UNK_ID = 2
 TEST_SAMPLE_COUNT = 10000  # 测试多少条数据
 DATASET_ID = 'wikimedia/wikipedia'

@@ -17,7 +17,7 @@ accelerate launch \
     --grad-accumulation 1 \
     --num-workers 2 \
     --epochs 1 \
-    --learning-rate 5e-5 \
+    --learning-rate 4e-5 \
     --log-interval 10 \
     --val-interval 200 \
     --save_every 2000 \
