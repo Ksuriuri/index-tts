@@ -39,9 +39,8 @@ from trainers.utils import ProcessedData
 random.seed(42)
 DATASET_ROOT = f"/mnt/data_3t_1/datasets/preprocess"
 DATASET_ROOTS = [
-    f"{DATASET_ROOT}/Emilia_JA",
-    f"{DATASET_ROOT}/Emilia-YODAS_JA",
-    f"{DATASET_ROOT}/Gacha_games_jp",
+    f"{DATASET_ROOT}/Japanese-Eroge-Voice",
+    f"{DATASET_ROOT}/Galgame-VisualNovel-Reupload",
 ]
 OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
@@ -52,7 +51,6 @@ PROCESSORS_PER_DEVICE = 1
 MAX_GPU_TASK_QUEUE_SIZE = 16  # 限制队列大小防止内存爆炸
 MAX_AUDIO_DURATION = 36
 BATCH_SIZE = 12
-
 
 TARGET_SR = 16000
 
@@ -354,6 +352,7 @@ class AudioLoaderWorker(Process):
     def run(self):
         logger.info(f"[CPU-Loader-{self.worker_id}] Started.")
         batch_req = []
+        
         while True:
             try:
                 parquet_path = self.file_queue.get(timeout=3)
@@ -364,7 +363,6 @@ class AudioLoaderWorker(Process):
                 break
 
             try:
-                # 计算相对路径，用于保持输出结构
                 rel_path = os.path.relpath(parquet_path, DATASET_ROOT)
                 output_path = os.path.join(OUTPUT_DIR, rel_path.replace(".parquet", ".pkl"))
                 if os.path.exists(output_path):
@@ -374,24 +372,59 @@ class AudioLoaderWorker(Process):
                 parquet_file = pq.ParquetFile(parquet_path)
                 valid_count = 0
                 duration_skip_num = 0
-                non_audio_or_text_skip_num = 0
+                segment_skip_num = 0
+                
                 pf_start_time = time.time()
                 pbar = tqdm(desc=f"CPU-Loader-{self.worker_id}: {rel_path}")
 
                 global_row_offset = 0 
 
-                for batch in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text']):
+                for batch in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text', 'whisper_large_v3']):
                     audio_col = batch['audio']
-                    text_col = batch['text']
+                    # text_col = batch['text'] # 原文如果是切分，通常使用 segments 里的 text，而不是原文的全文
+                    asr_col = batch['whisper_large_v3']
                     batch_len = len(batch)
 
                     for i in range(batch_len):
-                        # 计算当前行在整个Parquet文件中的绝对下标
                         current_file_index = global_row_offset + i
                         
-                        text = str(text_col[i])
-
                         try:
+                            asr_data = asr_col[i].as_py()
+                            segments = list(asr_data['segments'])
+                            
+                            if len(segments) == 0:
+                                segment_skip_num += 1
+                                pbar.update(1)
+                                continue
+
+                            # merged_groups 结构: List[List[SegmentDict]]
+                            merged_groups = []
+                            current_group = [segments[0]]
+                            
+                            for seg_idx in range(1, len(segments)):
+                                prev_seg = current_group[-1]
+                                curr_seg = segments[seg_idx]
+                                
+                                # 检查间隔：当前开始时间 - 上一段结束时间
+                                silence_gap = curr_seg['start'] - prev_seg['end']
+                                
+                                if silence_gap >= 0.5:
+                                    # 间隔大于等于0.5秒，结束当前组，开启新组
+                                    merged_groups.append(current_group)
+                                    current_group = [curr_seg]
+                                else:
+                                    # 间隔小于0.5秒，视为同一段语音，合并
+                                    current_group.append(curr_seg)
+                            
+                            if current_group:
+                                merged_groups.append(current_group)
+
+                            # 若能够分成两段及以上语音则保留，否则跳过
+                            if len(merged_groups) < 2:
+                                segment_skip_num += 1
+                                pbar.update(1)
+                                continue
+
                             array, sampling_rate = sf.read(io.BytesIO(audio_col[i]), dtype='float32')
                             duration = array.shape[0] / sampling_rate
                             if duration > MAX_AUDIO_DURATION:
@@ -400,38 +433,67 @@ class AudioLoaderWorker(Process):
 
                             if array.ndim > 1:
                                 array = np.mean(array, axis=1)
-                            
-                            audio_tensor = torch.from_numpy(array).float()
-                            audio_tensor.share_memory_()
-                            
-                            req = DataPreprocessorReqData(
-                                text=text,
-                                audio=audio_tensor,  # float32
-                                orig_sr=sampling_rate,
-                                file_rel_path=rel_path,
-                                original_index=current_file_index
-                            )
-                            batch_req.append(req)
-                            valid_count += 1
 
-                            if len(batch_req) >= BATCH_SIZE:
-                                self.gpu_task_queue.put(batch_req)
-                                batch_req = []
+                            # 5. 遍历切分后的组，生成请求数据
+                            for group in merged_groups:
+                                group_start_time = group[0]['start']
+                                group_end_time = group[-1]['end']
+                                # 拼接该段内的文本
+                                group_text = "".join([s['text'] for s in group]).strip()
+
+                                # 计算采样点索引
+                                pad_seconds = random.uniform(0.1, 0.2)
+                                start_time_padded = max(0.0, group_start_time - pad_seconds)
+                                end_time_padded = min(float(array.shape[0]) / sampling_rate, group_end_time + pad_seconds)
+
+                                start_sample = int(start_time_padded * sampling_rate)
+                                end_sample = int(end_time_padded * sampling_rate)
+
+                                # 提取音频切片
+                                audio_slice = array[start_sample:end_sample]
+                                
+                                # 检查切片后的时长 (可选：如果切出来的片段太长或太短，可以在这里过滤)
+                                slice_duration = audio_slice.shape[0] / sampling_rate
+                                if slice_duration <= 0: # 异常保护
+                                    continue
+                                if slice_duration > MAX_AUDIO_DURATION: # 如果切出来的片段依然过长
+                                    duration_skip_num += 1
+                                    continue
+                                
+                                audio_tensor = torch.from_numpy(audio_slice).float()
+                                audio_tensor.share_memory_()
+
+                                req = DataPreprocessorReqData(
+                                    text=group_text,           # 使用切分后的文本
+                                    audio=audio_tensor,        # 使用切分后的音频
+                                    orig_sr=sampling_rate,
+                                    file_rel_path=rel_path,
+                                    original_index=current_file_index # 保持原文件索引，方便溯源
+                                )
+                                batch_req.append(req)
+                                valid_count += 1
+
+                                if len(batch_req) >= BATCH_SIZE:
+                                    self.gpu_task_queue.put(batch_req)
+                                    batch_req = []
 
                         except Exception as e:
-                            logger.error(f"Error processing audio in {rel_path}: {traceback.format_exc()}")
+                            logger.error(f"Error processing audio in {rel_path} at row {current_file_index}: {traceback.format_exc()}")
                             continue
+                        
                         pbar.update(1)
                     
-                    # 更新全局偏移量
                     global_row_offset += batch_len
 
-                logger.error(f"[CPU-Loader-{self.worker_id}: {rel_path}] Samples: {valid_count}. Duration skip: {duration_skip_num}, time: {time.time()-pf_start_time:.4f}s")
+                logger.info(f"[CPU-Loader-{self.worker_id}: {rel_path}] Valid Samples Created: {valid_count}. "
+                            f"Seg < 2 skip: {segment_skip_num}, Slice Duration skip: {duration_skip_num}, "
+                            f"Time: {time.time()-pf_start_time:.4f}s")
                             
                 if len(batch_req) > 0:
                     self.gpu_task_queue.put(batch_req)
                     batch_req = []
                 
+                # 注意：这里的 valid_count 变成了切分后的片段总数
                 if valid_count > 0:
                     manifest = FileManifest(
                         file_rel_path=rel_path,
