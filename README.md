@@ -25,6 +25,16 @@ conda 环境：`index-tts`
 
 ## CV3-Eval 评测
 
+### 生成音频
+
+conda 环境：`cv3-eval`
+
+```bash
+python CV3-Eval.py --gpus 1,2,3,4,5,6,7
+```
+
+### 评测
+
 conda 环境：`cv3-eval`
 
 ```bash

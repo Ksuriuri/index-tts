@@ -444,6 +444,7 @@ class AudioLoaderWorker(Process):
                                 # 计算采样点索引
                                 pad_seconds = random.uniform(0.1, 0.2)
                                 start_time_padded = max(0.0, group_start_time - pad_seconds)
+                                pad_seconds = random.uniform(0.3, 0.5)
                                 end_time_padded = min(float(array.shape[0]) / sampling_rate, group_end_time + pad_seconds)
 
                                 start_sample = int(start_time_padded * sampling_rate)

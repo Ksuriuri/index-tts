@@ -483,8 +483,8 @@ def main() -> None:
     )
     
     # total_steps = args.max_steps if args.max_steps > 0 else args.epochs * len(train_loader) // max(1, args.grad_accumulation)
-    num_batches_per_epoch = len(train_loader) // accelerator.num_processes
-    num_update_steps_per_epoch = math.ceil(num_batches_per_epoch / args.grad_accumulation)
+    # num_batches_per_epoch = len(train_loader) // accelerator.num_processes
+    num_update_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accumulation)
     total_steps = args.epochs * num_update_steps_per_epoch
 
     if accelerator.is_main_process:
@@ -553,9 +553,9 @@ def main() -> None:
                     if args.grad_clip > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
                 
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
             # 只有在梯度更新发生后才增加 global_step 和记录日志
             if accelerator.sync_gradients:

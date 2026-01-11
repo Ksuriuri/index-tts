@@ -284,12 +284,8 @@ class IndexTTS2:
         """
         Silences to be insert between generated segments.
         """
-
-        if not wavs or interval_silence <= 0:
-            return wavs
-
         # get channel_size
-        channel_size = wavs[0].size(0)
+        channel_size = wavs.shape[0]
         # get silence tensor
         sil_dur = int(sampling_rate * interval_silence / 1000.0)
         return torch.zeros(channel_size, sil_dur)
@@ -333,6 +329,8 @@ class IndexTTS2:
             if verbose:
                 print(f"Audio too long ({audio.shape[1]} samples), truncating to {max_audio_samples} samples")
             audio = audio[:, :max_audio_samples]
+        # 末尾加0.3秒静音
+        audio = torch.cat([audio, self.interval_silence(audio, interval_silence=0.3)], dim=1)
         return audio, sr
     
     def normalize_emo_vec(self, emo_vector, apply_bias=True):

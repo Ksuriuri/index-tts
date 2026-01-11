@@ -13,14 +13,14 @@ accelerate launch \
     --batch-size-per-device 4 \
     --grad-accumulation 1 \
     --num-workers 2 \
-    --epochs 1 \
+    --epochs 3 \
     --learning-rate 4e-5 \
     --log-interval 10 \
     --val-interval 200 \
-    --save_every 2000 \
+    --save_every 5000 \
     --keep-last 4 \
-    --major-save-every 25000 \
+    --major-save-every 50000 \
     --use-duration-control \
     --duration-dropout 0.3 \
     --wandb-project "IndexTTS2-jp" \
-    --wandb-run-name "20260108-test"
+    --wandb-run-name "202601011-test"
