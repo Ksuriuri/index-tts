@@ -16,7 +16,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260115"
+TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260116"
 
 SOURCE_NAMES = [
     "Emilia_JA",
