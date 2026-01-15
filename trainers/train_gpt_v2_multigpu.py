@@ -620,7 +620,7 @@ def main() -> None:
                         torch.save({"model": real_model.state_dict()}, weight_path)
                         print(f"[Checkpoint] Saved checkpoint to {save_path}")
 
-                        # 执行轮换：保留4个最新的，除非是25000的倍数
+                        # 执行轮换：保留4个最新的，除非是 major_save_every 的倍数
                         rotate_checkpoints(
                             output_dir=output_dir,
                             keep_last=args.keep_last,

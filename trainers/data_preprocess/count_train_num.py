@@ -30,14 +30,16 @@ DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
 # 预处理 Parquet 文件的根目录
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 # 输出目录
-TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260107"
+TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260114"
 
 SHARD_SIZE = 40000  # 每个分片包含的数据量
 MIN_DURATION = 0
 MAX_DURATION = 36
 MIN_TEXT_TOKENS = 1
 MAX_TEXT_TOKENS = 600
-CER_THRESHOLD = 0.35  # CER 过滤阈值
+CER_THRESHOLD = 0.05  # CER 过滤阈值
+# CER_TYPE = "cer"
+CER_TYPE = "pron_CER"
 
 def get_parquet_path(pkl_path: str, source_name: str) -> str:
     try:
@@ -121,7 +123,7 @@ def main():
                     
                     # ================= 2. CER 过滤逻辑 =================
                     whisper_info = row["whisper_large_v3"]
-                    cer = whisper_info.get("cer", 1.0) # 默认 1.0 (Bad)
+                    cer = whisper_info.get(CER_TYPE, 1.0) # 默认 1.0 (Bad)
                     if cer > CER_THRESHOLD: 
                         cer_skip_num += 1
                         continue

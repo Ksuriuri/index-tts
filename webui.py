@@ -116,8 +116,8 @@ def gen_single(emo_control_method,prompt, text,
                max_text_tokens_per_segment=120,
                 *args, progress=gr.Progress()):
     output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+    # if not output_path:
+    #     output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
     # set gradio progress
     tts.gr_progress = progress
     do_sample, top_p, top_k, temperature, \

@@ -22,6 +22,7 @@ cloudflared tunnel --url http://127.0.0.1:7860
 conda 环境：`index-tts`
 
 1. 使用 `trainers/data_preprocess/preprocess_xxx.py` 预处理原始数据，主要执行 ASR 并计算 CER（保存为 .parquet 格式）
+2. 使用 `trainers/data_preprocess/pron_cer_calc_xx.py`: 计算发音级别的 CER，追加到 .parquet 文件中
 2. 使用 `trainers/data_preprocess/speaker_diarization.py`: 生成说话人日志，追加到 .parquet 文件中
 3. 使用 `trainers/data_preprocess/gen_indextts_emb_xxx.py`: 预处理训练数据：生成 embedding 和 token id（.pkl 格式）
 4. 使用 `trainers/data_preprocess/convert_to_arrow_multi.py`: 生成最终训练数据集（.arrow 格式）

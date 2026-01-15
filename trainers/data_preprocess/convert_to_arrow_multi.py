@@ -13,31 +13,40 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 # ================= 配置区域 (保持不变) =================
+
+PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
+TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260115"
+
 SOURCE_NAMES = [
     "Emilia_JA",
     "Emilia-YODAS_JA",
     "Gacha_games_jp",
     "Galgame-VisualNovel-Reupload",
-    "Japanese-Eroge-Voice"
+    # "Japanese-Eroge-Voice"
 ]
 
-DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
-TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260107"
+END_SILENCE_FILTER_NAMES = [
+    "Emilia_JA",
+    "Emilia-YODAS_JA",
+    "Gacha_games_jp",
+]
 
 SHARD_SIZE = 40000 
 MIN_DURATION = 0
 MAX_DURATION = 36
 MIN_TEXT_TOKENS = 1
 MAX_TEXT_TOKENS = 600
-CER_THRESHOLD = 0.35 
+CER_THRESHOLD = 0.05  # 0.10
+# CER_TYPE = "cer"
+CER_TYPE = "pron_CER"
+END_SILENCE_MIN = 0.0
+END_SILENCE_MAX = 0.5
 
 # 并行配置
-NUM_WORKERS = max(1, multiprocessing.cpu_count() - 4) # 预留核心给系统和Saver
+NUM_WORKERS = 8  # max(1, multiprocessing.cpu_count() - 4) # 预留核心给系统和Saver
 MAX_PENDING_SAVES = 2 # 限制后台同时保存的分片数，防止内存爆炸
 
-# 需要引入 ProcessedData 类定义，确保多进程能序列化
-# 假设它在 trainers.utils 中，这里为了演示保留 import
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(root_dir)
 from trainers.utils import ProcessedData
@@ -45,7 +54,6 @@ from trainers.utils import ProcessedData
 # ================= 工具函数 =================
 
 def get_parquet_path(pkl_path: str, source_name: str) -> str:
-    # ... (保持原有逻辑不变)
     try:
         path_parts = pkl_path.split(os.sep)
         idx = path_parts.index(source_name)
@@ -57,15 +65,12 @@ def get_parquet_path(pkl_path: str, source_name: str) -> str:
         return None
 
 def generate_derangement(n):
-    # ... (保持原有逻辑不变)
     indices = np.arange(n)
     if n < 2: return indices
     while True:
         np.random.shuffle(indices)
         if not np.any(indices == np.arange(n)):
             return indices
-
-# ================= 核心并行函数 =================
 
 def process_single_file(args):
     """
@@ -74,7 +79,7 @@ def process_single_file(args):
     """
     file_path, source_name = args
     valid_items = []
-    stats = {"cer_skip": 0, "diar_skip": 0, "processed": 1}
+    stats = {"cer_skip": 0, "diar_skip": 0, "not_silence_skip": 0, "processed": 1}
 
     try:
         parquet_path = get_parquet_path(file_path, source_name)
@@ -94,7 +99,7 @@ def process_single_file(args):
             return [], stats
 
         for item in data_list:
-            processed_data = item["data"]
+            processed_data: ProcessedData = item["data"]
             parquet_idx = item["index"]
             
             # 安全检查索引越界
@@ -103,34 +108,46 @@ def process_single_file(args):
                 
             row = df_meta.iloc[parquet_idx]
 
-            # 1. CER 过滤
+            # CER 过滤
             whisper_info = row["whisper_large_v3"]
-            cer = whisper_info.get("cer", 1.0)
+            cer = whisper_info.get(CER_TYPE, 1.0)
             if cer > CER_THRESHOLD:
                 stats["cer_skip"] += 1
                 continue
 
-            # 2. Diarization 过滤
+            # Diarization 过滤
             unique_speakers = set(seg['speaker'] for seg in row["speaker_diarization"])
             if len(unique_speakers) != 1:
                 stats["diar_skip"] += 1
                 continue
+            
+            # 尾部静音过滤
+            if source_name in END_SILENCE_FILTER_NAMES:
+                total_duration = processed_data.duration
+                segments = list(whisper_info.get("segments", []))
+                
+                skip_flag = True
+                if segments:
+                    last_seg_end = segments[-1]["end"]
+                    tail_gap = total_duration - last_seg_end
+                    if END_SILENCE_MIN <= tail_gap <= END_SILENCE_MAX:
+                        skip_flag = False
+                if skip_flag:
+                    stats["not_silence_skip"] += 1
+                    continue
 
-            # 3. Speaker ID 生成
+            # Speaker ID 生成
             raw_speaker = row.get("speaker", None)
             if raw_speaker is not None:
                 spk_id = str(raw_speaker)
             else:
                 spk_id = f"{source_name}_idx_{parquet_idx}"
 
-            # 4. 时长/长度过滤
+            # 时长/长度过滤
             if (processed_data.duration < MIN_DURATION or processed_data.duration > MAX_DURATION or
                 processed_data.text_len < MIN_TEXT_TOKENS or processed_data.text_len > MAX_TEXT_TOKENS):
                 continue
 
-            # 转换为 numpy 对象 (假设 ProcessedData 里面有 to_numpy)
-            # 注意：多进程传递 huge numpy arrays 会有序列化开销
-            # 但相比于文件IO，这通常是可以接受的
             processed_data_np = processed_data.to_numpy()
 
             valid_items.append({
@@ -277,6 +294,8 @@ def main():
                 "Shards": shard_count,
                 "Backlog": len(save_futures)
             })
+
+            print(f"Processed done, stats: {stats}")
 
     # 5. 处理剩余数据
     if len(pending_items) > 0:
