@@ -35,7 +35,7 @@ conda 环境：`index-tts`
 conda 环境：`cv3-eval`
 
 ```bash
-python CV3-Eval.py --gpus 1,2,3,4,5,6,7
+python CV3-Eval.py --gpus 0,1,2,3,4,5,6,7
 ```
 
 ### 评测

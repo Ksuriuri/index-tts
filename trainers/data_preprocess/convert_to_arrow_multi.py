@@ -16,14 +16,14 @@ from concurrent.futures import ProcessPoolExecutor
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260116"
+TARGET_DIR = f"{DATA_ROOT}/final_train_data/train_data_v2_260117"
 
 SOURCE_NAMES = [
     "Emilia_JA",
     "Emilia-YODAS_JA",
     "Gacha_games_jp",
     "Galgame-VisualNovel-Reupload",
-    # "Japanese-Eroge-Voice"
+    "Japanese-Eroge-Voice"
 ]
 
 END_SILENCE_FILTER_NAMES = [
@@ -37,11 +37,11 @@ MIN_DURATION = 0
 MAX_DURATION = 36
 MIN_TEXT_TOKENS = 1
 MAX_TEXT_TOKENS = 600
-CER_THRESHOLD = 0.05  # 0.10
-# CER_TYPE = "cer"
-CER_TYPE = "pron_CER"
+CER_THRESHOLD = 0.10  # 0.10
+CER_TYPE = "cer"
+# CER_TYPE = "pron_CER"
 END_SILENCE_MIN = 0.0
-END_SILENCE_MAX = 0.5
+END_SILENCE_MAX = 0.7  # 0.5
 
 # 并行配置
 NUM_WORKERS = 8  # max(1, multiprocessing.cpu_count() - 4) # 预留核心给系统和Saver

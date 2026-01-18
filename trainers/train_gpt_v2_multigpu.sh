@@ -7,13 +7,13 @@ accelerate launch \
     --tokenizer checkpoints/IndexTTS-2-vLLM/jp_bpe.model \
     --base-checkpoint checkpoints/IndexTTS-2-vLLM/gpt.pth \
     --train-data-dir \
-    /mnt/data_3t_2/datasets/indextts_train_data_v2/final_train_data/train_data_v2_260116 \
+    /mnt/data_3t_2/datasets/indextts_train_data_v2/final_train_data/train_data_v2_260117 \
     --val-data-size 128 \
     --output-dir ./trained_ckpts \
     --batch-size-per-device 4 \
     --grad-accumulation 1 \
     --num-workers 2 \
-    --epochs 3 \
+    --epochs 4 \
     --learning-rate 4e-5 \
     --log-interval 10 \
     --val-interval 200 \
@@ -23,4 +23,4 @@ accelerate launch \
     --use-duration-control \
     --duration-dropout 0.3 \
     --wandb-project "IndexTTS2-jp" \
-    --wandb-run-name "20260116-test"
+    --wandb-run-name "20260117-test"
