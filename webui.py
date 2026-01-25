@@ -338,7 +338,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         if text and len(text) > 0:
             text_tokens_list = tts.tokenizer.tokenize(text)
 
-            segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_text_tokens_per_segment))
+            segments = tts.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_segment=int(max_text_tokens_per_segment))
             data = []
             for i, s in enumerate(segments):
                 segment_str = ''.join(s)
