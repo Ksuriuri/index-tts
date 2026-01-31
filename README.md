@@ -21,11 +21,41 @@ cloudflared tunnel --url http://127.0.0.1:7860
 
 conda 环境：`index-tts`
 
-1. 使用 `trainers/data_preprocess/preprocess_xxx.py` 预处理原始数据，主要执行 ASR 并计算 CER（保存为 .parquet 格式）
-2. 使用 `trainers/data_preprocess/pron_cer_calc_xx.py`: 计算发音级别的 CER，追加到 .parquet 文件中
-2. 使用 `trainers/data_preprocess/speaker_diarization.py`: 生成说话人日志，追加到 .parquet 文件中
-3. 使用 `trainers/data_preprocess/gen_indextts_emb_xxx.py`: 预处理训练数据：生成 embedding 和 token id（.pkl 格式）
-4. 使用 `trainers/data_preprocess/convert_to_arrow_multi.py`: 生成最终训练数据集（.arrow 格式）
+### 1. 转为标准格式
+- 使用 `trainers/data_preprocess/preprocess_xxx.py` 预处理原始数据，主要执行 ASR 并计算 CER（保存为 .parquet 格式）
+- 其中，`.parquet` 文件中每行的内容如下：
+```python
+{
+    "audio": 音频文件的二进制数据流,
+    "text": 数据集原文本,
+    "speaker": 说话人ID,
+    "whisper_large_v3": {
+        "text": ASR文本,
+        "cer": float,
+        "language": str,
+        "segments": [{"text": str, "start": float, "end": float}, ...]
+    }
+}
+```
+
+### 2. 计算发音级别的 CER
+- 使用 `trainers/data_preprocess/pron_cer_calc_xxx.py` 计算发音级别的 CER，追加到 .parquet 文件中
+- 具体来说，在 `whisper_large_v3` 中添加 `pron_CER` 字段，float()
+
+### 3. 生成说话人日志
+- 使用 `trainers/data_preprocess/speaker_diarization.py`: 生成说话人日志，追加到 .parquet 文件中
+- 具体来说，添加了 `speaker_diarization` 字段：`[{"speaker": str, "start": float, "end": float}, ...]`
+
+### 4. 预处理训练数据
+使用 `trainers/data_preprocess/gen_indextts_emb_xxx.py`: 预处理训练数据：生成 embedding 和 token id（.pkl 格式）
+- 其中，`.pkl` 文件与原 `.parquet` 一一对应，内容为 `List[Dict[str, Any]]`，具体是 `[{"index": int, "data": ProcessedData}]`，`ProcessedData` 参考 `trainers.utils`
+- 对于无说话人标签的数据，将语音间静音大于 MIN_SILLENCE_DURATION 的片段进行切分，`index` 指向切分前的 `index`
+
+### 5. 生成最终训练数据集
+#### 不使用生成数据
+- 使用 `trainers/data_preprocess/convert_to_arrow_multi.py` 生成最终训练数据集（.arrow 格式）
+- 根据 CER 或者 pron_CER 过滤；根据 `speaker_diarization` 过滤说话人数量不等于1的数据；根据 whisper 的 segments 字段最后一个 end 过滤末尾过长的数据
+- 对于原 `.parquet` 文件中 `speaker` 字段为 None 的数据，将 `speaker` 字段设置为 `{source_name}_idx_{index}`，这样便能标记同一说话人
 
 
 ## CV3-Eval 评测

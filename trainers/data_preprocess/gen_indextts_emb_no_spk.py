@@ -50,6 +50,7 @@ DEVICE_NUM = 8
 PROCESSORS_PER_DEVICE = 1
 MAX_GPU_TASK_QUEUE_SIZE = 16  # 限制队列大小防止内存爆炸
 MAX_AUDIO_DURATION = 36
+MIN_SILLENCE_DURATION = 0.5
 BATCH_SIZE = 12
 
 TARGET_SR = 16000
@@ -408,12 +409,12 @@ class AudioLoaderWorker(Process):
                                 # 检查间隔：当前开始时间 - 上一段结束时间
                                 silence_gap = curr_seg['start'] - prev_seg['end']
                                 
-                                if silence_gap >= 0.5:
-                                    # 间隔大于等于0.5秒，结束当前组，开启新组
+                                if silence_gap >= MIN_SILLENCE_DURATION:
+                                    # 间隔大于等于 MIN_SILLENCE_DURATION 秒，结束当前组，开启新组
                                     merged_groups.append(current_group)
                                     current_group = [curr_seg]
                                 else:
-                                    # 间隔小于0.5秒，视为同一段语音，合并
+                                    # 间隔小于 MIN_SILLENCE_DURATION 秒，视为同一段语音，合并
                                     current_group.append(curr_seg)
                             
                             if current_group:
