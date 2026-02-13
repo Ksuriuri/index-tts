@@ -46,6 +46,11 @@ conda 环境：`index-tts`
 - 使用 `trainers/data_preprocess/speaker_diarization.py`: 生成说话人日志，追加到 .parquet 文件中
 - 具体来说，添加了 `speaker_diarization` 字段：`[{"speaker": str, "start": float, "end": float}, ...]`
 
+### 3.5. 为无说话人标签数据生成参考音频
+- 使用 `trainers/data_preprocess/speaker_synthesis_indextts_jp.py`: 为无说话人标签数据生成参考音频，保存为同目录结构且同名的 .parquet 文件中仅保存 `audio` 和 `text` 字段
+- 当前过滤条件：1. 原音频大于6秒且小于36秒；2. pron_CE小于0.5；3. 音频中仅有一个说话人
+- 生成文本：提取原文件中长度小于100且大于10的文本组成数组，从中随机选择
+
 ### 4. 预处理训练数据
 使用 `trainers/data_preprocess/gen_indextts_emb_xxx.py`: 预处理训练数据：生成 embedding 和 token id（.pkl 格式）
 - 其中，`.pkl` 文件与原 `.parquet` 一一对应，内容为 `List[Dict[str, Any]]`，具体是 `[{"index": int, "data": ProcessedData}]`，`ProcessedData` 参考 `trainers.utils`

@@ -38,10 +38,10 @@ from trainers.utils import ProcessedData
 
 random.seed(42)
 DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+SYNTHESIS_ROOT = "/mnt/data_3t_1/datasets/preprocess/synthesis_data"
 DATASET_ROOTS = [
-    f"{DATASET_ROOT}/Emilia_JA",
-    f"{DATASET_ROOT}/Emilia-YODAS_JA",
-    f"{DATASET_ROOT}/Gacha_games_jp",
+    f"{DATASET_ROOT}/Galgame-VisualNovel-Reupload",
+    f"{DATASET_ROOT}/Japanese-Eroge-Voice",
 ]
 OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
@@ -59,7 +59,8 @@ TARGET_SR = 16000
 @dataclass
 class DataPreprocessorReqData:
     text: str
-    audio: torch.Tensor
+    audio: torch.Tensor  # 原始音频
+    synthesis_audio: torch.Tensor  # 合成音频
     orig_sr: int
     file_rel_path: str
     original_index: int
@@ -148,7 +149,7 @@ class DataPreprocessor(Process):
         try:
             fake_audio = torch.zeros(16000, dtype=torch.float32)
             fake_text = "123"
-            self.preprocess(fake_text, fake_audio)
+            self.preprocess(fake_text, fake_audio, fake_audio)
         except Exception as e:
             logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] healthy check error: {e}')
             return False
@@ -189,16 +190,25 @@ class DataPreprocessor(Process):
         texts = [d.text for d in input_data_list]
         
         audio_tensors = []
+        synthesis_audio_tensors = []
         for d in input_data_list:
-            # wav = torch.from_numpy(d.audio)
+            # 处理原始音频
             wav = d.audio
             if d.orig_sr != TARGET_SR:
                 wav = wav.to(self.device, non_blocking=True)
                 resampler = self.get_resampler(d.orig_sr)
                 wav = resampler(wav)
             audio_tensors.append(wav)
+            
+            # 处理合成音频
+            syn_wav = d.synthesis_audio
+            if d.orig_sr != TARGET_SR:
+                syn_wav = syn_wav.to(self.device, non_blocking=True)
+                resampler = self.get_resampler(d.orig_sr)
+                syn_wav = resampler(syn_wav)
+            synthesis_audio_tensors.append(syn_wav)
         
-        processed_datas = self.preprocess_batch(texts, audio_tensors)
+        processed_datas = self.preprocess_batch(texts, audio_tensors, synthesis_audio_tensors)
         
         results = []
         for i, p_data in enumerate(processed_datas):
@@ -222,9 +232,11 @@ class DataPreprocessor(Process):
         self,
         text: str,
         audio: torch.Tensor,
+        synthesis_audio: torch.Tensor,
     ):
         """
-        audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
+        audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1] (原始音频)
+        synthesis_audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1] (合成音频)
         """
         duration = audio.shape[0] / 16000
         # Tokenize Text
@@ -235,26 +247,40 @@ class DataPreprocessor(Process):
         text_ids = torch.tensor(text_ids, dtype=torch.int16)  # [text_len]
         text_len = len(text_ids)
 
-        # Extract Features
-        inputs = self.extract_features(audio, sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+        # Extract Features for synthesis audio (用于condition)
+        inputs_syn = self.extract_features(synthesis_audio, sampling_rate=16000, return_tensors="pt")
+        input_features_syn = inputs_syn["input_features"].to(self.device)
+        attention_mask_syn = inputs_syn["attention_mask"].to(self.device)
         
-        # Get Speaker Condition Embedding
-        spk_cond_emb = self.get_emb(input_features, attention_mask)
+        # Get Speaker Condition Embedding from synthesis audio
+        spk_cond_emb_syn = self.get_emb(input_features_syn, attention_mask_syn)
 
-        # Quantize / Codec
-        cond_lengths = attention_mask.sum(dim=1).long()
-        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb)
+        # Quantize / Codec (使用合成音频)
+        cond_lengths_syn = attention_mask_syn.sum(dim=1).long()
+        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb_syn)
         semantic_code = semantic_code.squeeze(0)
         code_len = semantic_code.shape[0]
 
-        # Get Conditioning & Emotion Vector
-        feat_t = spk_cond_emb.transpose(1, 2)
-        cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
+        # Get Conditioning from synthesis audio
+        feat_t_syn = spk_cond_emb_syn.transpose(1, 2)
+        cond_lengths_device_syn = cond_lengths_syn.to(spk_cond_emb_syn.device)
         
-        conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device).squeeze(0)  # [32, 1280]
-        emo_vec = self.gpt.get_emovec(spk_cond_emb, cond_lengths_device).squeeze(0)  # [1280]
+        conditioning = self.gpt.get_conditioning(feat_t_syn, cond_lengths_device_syn).squeeze(0)  # [32, 1280]
+        
+        # emo_vec: 50%概率使用原音频，50%概率使用合成音频
+        use_original_for_emo = random.random() < 0.5
+        if use_original_for_emo:
+            # 使用原始音频生成emo_vec
+            inputs_orig = self.extract_features(audio, sampling_rate=16000, return_tensors="pt")
+            input_features_orig = inputs_orig["input_features"].to(self.device)
+            attention_mask_orig = inputs_orig["attention_mask"].to(self.device)
+            spk_cond_emb_orig = self.get_emb(input_features_orig, attention_mask_orig)
+            cond_lengths_orig = attention_mask_orig.sum(dim=1).long()
+            cond_lengths_device_orig = cond_lengths_orig.to(spk_cond_emb_orig.device)
+            emo_vec = self.gpt.get_emovec(spk_cond_emb_orig, cond_lengths_device_orig).squeeze(0)  # [1280]
+        else:
+            # 使用合成音频生成emo_vec
+            emo_vec = self.gpt.get_emovec(spk_cond_emb_syn, cond_lengths_device_syn).squeeze(0)  # [1280]
 
         processed_data = ProcessedData(
             text_ids=text_ids.to(device="cpu", dtype=torch.int16),
@@ -272,9 +298,11 @@ class DataPreprocessor(Process):
         self,
         texts: List[str],
         audios: List[torch.Tensor],
+        synthesis_audios: List[torch.Tensor],
     ):
         """
-        audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
+        audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1] (原始音频)
+        synthesis_audios: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1] (合成音频)
         """
         batch_size = len(texts)
         durations = [audio.shape[0] / 16000 for audio in audios]
@@ -291,34 +319,60 @@ class DataPreprocessor(Process):
             text_ids_list.append(text_ids)
             text_lens.append(text_len)
 
-        # Extract Features
-        inputs = self.extract_features([a.cpu().numpy() for a in audios], sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+        # Extract Features for synthesis audios (用于condition)
+        inputs_syn = self.extract_features([a.cpu().numpy() for a in synthesis_audios], sampling_rate=16000, return_tensors="pt")
+        input_features_syn = inputs_syn["input_features"].to(self.device)
+        attention_mask_syn = inputs_syn["attention_mask"].to(self.device)
         
-        # Get Speaker Condition Embedding
-        spk_cond_emb = self.get_emb(input_features, attention_mask)
+        # Get Speaker Condition Embedding from synthesis audios
+        spk_cond_emb_syn = self.get_emb(input_features_syn, attention_mask_syn)
 
-        # Quantize / Codec
-        cond_lengths = attention_mask.sum(dim=1).long()
-        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb)  # [b, code_len]
+        # Quantize / Codec (使用合成音频)
+        cond_lengths_syn = attention_mask_syn.sum(dim=1).long()
+        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb_syn)  # [b, code_len]
 
         semantic_codes = []
         code_lens = []
         for b in range(batch_size):
-            semantic_code_ = semantic_code[b, :cond_lengths[b]]
+            semantic_code_ = semantic_code[b, :cond_lengths_syn[b]]
             semantic_codes.append(semantic_code_)
             code_lens.append(semantic_code_.shape[0])
 
-        # Get Conditioning & Emotion Vector
-        feat_t = spk_cond_emb.transpose(1, 2)
-        cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
+        # Get Conditioning from synthesis audios
+        feat_t_syn = spk_cond_emb_syn.transpose(1, 2)
+        cond_lengths_device_syn = cond_lengths_syn.to(spk_cond_emb_syn.device)
         
-        conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device)  # [b, 32, 1280]
-        emo_vec = self.gpt.get_emovec(spk_cond_emb, cond_lengths_device)  # [b, 1280]
+        conditioning = self.gpt.get_conditioning(feat_t_syn, cond_lengths_device_syn)  # [b, 32, 1280]
+        
+        # Extract Features for original audios (用于emo_vec，50%概率使用)
+        inputs_orig = self.extract_features([a.cpu().numpy() for a in audios], sampling_rate=16000, return_tensors="pt")
+        input_features_orig = inputs_orig["input_features"].to(self.device)
+        attention_mask_orig = inputs_orig["attention_mask"].to(self.device)
+        
+        # Get Speaker Condition Embedding from original audios
+        spk_cond_emb_orig = self.get_emb(input_features_orig, attention_mask_orig)
+        cond_lengths_orig = attention_mask_orig.sum(dim=1).long()
+        cond_lengths_device_orig = cond_lengths_orig.to(spk_cond_emb_orig.device)
+        
+        # Get emo_vec from both original and synthesis audios
+        emo_vec_orig = self.gpt.get_emovec(spk_cond_emb_orig, cond_lengths_device_orig)  # [b, 1280]
+        emo_vec_syn = self.gpt.get_emovec(spk_cond_emb_syn, cond_lengths_device_syn)  # [b, 1280]
+        
+        # emo_vec: 50%概率使用原音频，50%概率使用合成音频
+        # 为每个样本随机决定使用哪个音频
+        emo_vec_batch = []
+        for b in range(batch_size):
+            use_original_for_emo = random.random() < 0.5
+            if use_original_for_emo:
+                emo_vec_batch.append(emo_vec_orig[b])
+            else:
+                emo_vec_batch.append(emo_vec_syn[b])
+        
+        # 将emo_vec_batch转换为tensor
+        emo_vec_batch = torch.stack(emo_vec_batch, dim=0)  # [b, 1280]
 
         conditioning = conditioning.to(device="cpu", dtype=torch.float16)
-        emo_vec = emo_vec.to(device="cpu", dtype=torch.float16)
+        emo_vec_batch = emo_vec_batch.to(device="cpu", dtype=torch.float16)
 
         processed_datas = []
         for b in range(batch_size):
@@ -328,7 +382,7 @@ class DataPreprocessor(Process):
                 text_len=text_lens[b],
                 code_len=code_lens[b],
                 condition=conditioning[b].clone(),
-                emo_vec=emo_vec[b].clone(),
+                emo_vec=emo_vec_batch[b].clone(),
                 duration=durations[b],
             )
             processed_datas.append(processed_data.to_numpy())
@@ -351,6 +405,21 @@ class AudioLoaderWorker(Process):
         self.writer_control_queue = writer_control_queue
         self.worker_id = worker_id
 
+    def get_synthesis_path(self, original_parquet_path):
+        """
+        根据原始parquet路径获取对应的合成音频parquet路径
+        """
+        # 从原始路径中提取数据集名称
+        rel_path = os.path.relpath(original_parquet_path, DATASET_ROOT)
+        dataset_name = rel_path.split(os.sep)[0]
+        
+        # 构建合成音频路径
+        synthesis_dataset_name = f"{dataset_name}_indextts_jp"
+        synthesis_rel_path = os.path.join(synthesis_dataset_name, os.sep.join(rel_path.split(os.sep)[1:]))
+        synthesis_path = os.path.join(SYNTHESIS_ROOT, synthesis_rel_path)
+        
+        return synthesis_path
+
     def run(self):
         logger.info(f"[CPU-Loader-{self.worker_id}] Started.")
         batch_req = []
@@ -371,7 +440,24 @@ class AudioLoaderWorker(Process):
                     logger.error(f"[CPU-Loader-{self.worker_id}] Skipping {rel_path} as it already exists.")
                     continue
 
+                # 获取合成音频路径
+                synthesis_parquet_path = self.get_synthesis_path(parquet_path)
+                if not os.path.exists(synthesis_parquet_path):
+                    logger.warning(f"[CPU-Loader-{self.worker_id}] Synthesis file not found: {synthesis_parquet_path}, skipping {rel_path}")
+                    continue
+
+                # 读取原始parquet文件
                 parquet_file = pq.ParquetFile(parquet_path)
+                # 读取合成parquet文件
+                synthesis_parquet_file = pq.ParquetFile(synthesis_parquet_path)
+                
+                # 检查两个文件的行数是否一致
+                orig_num_rows = parquet_file.metadata.num_rows
+                syn_num_rows = synthesis_parquet_file.metadata.num_rows
+                if orig_num_rows != syn_num_rows:
+                    logger.warning(f"[CPU-Loader-{self.worker_id}] Row count mismatch: original={orig_num_rows}, synthesis={syn_num_rows}, skipping {rel_path}")
+                    continue
+                
                 valid_count = 0
                 duration_skip_num = 0
                 non_audio_or_text_skip_num = 0
@@ -380,9 +466,13 @@ class AudioLoaderWorker(Process):
 
                 global_row_offset = 0 
 
-                for batch in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text']):
+                # 同时迭代两个parquet文件
+                orig_batches = parquet_file.iter_batches(batch_size=256, columns=['audio', 'text'])
+                syn_batches = synthesis_parquet_file.iter_batches(batch_size=256, columns=['audio', 'text'])
+                for batch, syn_batch in zip(orig_batches, syn_batches):
                     audio_col = batch['audio']
                     text_col = batch['text']
+                    syn_audio_col = syn_batch['audio']
                     batch_len = len(batch)
 
                     for i in range(batch_len):
@@ -392,6 +482,7 @@ class AudioLoaderWorker(Process):
                         text = str(text_col[i])
 
                         try:
+                            # 读取原始音频
                             array, sampling_rate = sf.read(io.BytesIO(audio_col[i]), dtype='float32')
                             duration = array.shape[0] / sampling_rate
                             if duration > MAX_AUDIO_DURATION:
@@ -404,9 +495,26 @@ class AudioLoaderWorker(Process):
                             audio_tensor = torch.from_numpy(array).float()
                             audio_tensor.share_memory_()
                             
+                            # 读取合成音频
+                            if not syn_audio_col[i] or len(syn_audio_col[i]) == 0:
+                                # 如果合成音频为空，跳过该样本
+                                continue
+                            
+                            syn_array, syn_sampling_rate = sf.read(io.BytesIO(syn_audio_col[i]), dtype='float32')
+                            if syn_array.ndim > 1:
+                                syn_array = np.mean(syn_array, axis=1)
+                            
+                            # 检查合成音频长度是否合理
+                            if len(syn_array) == 0:
+                                continue
+                            
+                            synthesis_audio_tensor = torch.from_numpy(syn_array).float()
+                            synthesis_audio_tensor.share_memory_()
+                            
                             req = DataPreprocessorReqData(
                                 text=text,
                                 audio=audio_tensor,  # float32
+                                synthesis_audio=synthesis_audio_tensor,  # float32
                                 orig_sr=sampling_rate,
                                 file_rel_path=rel_path,
                                 original_index=current_file_index

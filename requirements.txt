@@ -3,3 +3,6 @@
 # for pron_cer_calc
 mecab-python3
 unidic-lite
+
+# for speaker synthesis
+filetype
