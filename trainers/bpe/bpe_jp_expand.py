@@ -1,16 +1,7 @@
 import sys
 import unicodedata
 
-# 尝试导入 protobuf 定义
-# 如果报错，请确保当前目录下有 sentencepiece_model_pb2.py 文件
-# try:
-# import sentencepiece_model_pb2 as model_pb2
 from sentencepiece import sentencepiece_model_pb2 as model_pb2
-# except ImportError:
-#     print("错误: 找不到 sentencepiece_model_pb2 模块。")
-#     print("请下载 sentencepiece_model.proto 并使用 protoc 编译生成该文件，")
-#     print("或者直接下载现成的 sentencepiece_model_pb2.py 到当前目录。")
-#     sys.exit(1)
 
 def generate_jp_candidates():
     """生成所有待添加的日文候选字符"""

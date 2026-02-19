@@ -37,13 +37,23 @@ from indextts.utils.front import TextNormalizer, TextTokenizer
 from trainers.utils import ProcessedData
 
 random.seed(42)
-DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+
+# DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+# DATASET_ROOTS = [
+#     f"{DATASET_ROOT}/Emilia_JA",
+#     f"{DATASET_ROOT}/Emilia-YODAS_JA",
+#     f"{DATASET_ROOT}/Gacha_games_jp",
+# ]
+# OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
+
+DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess/Spanish"
 DATASET_ROOTS = [
-    f"{DATASET_ROOT}/Emilia_JA",
-    f"{DATASET_ROOT}/Emilia-YODAS_JA",
-    f"{DATASET_ROOT}/Gacha_games_jp",
+    f"{DATASET_ROOT}/google-chilean-spanish",
+    f"{DATASET_ROOT}/MLS_Spanish",
+    f"{DATASET_ROOT}/voxpopuli",
 ]
-OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
+OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_Spanish"
+
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数

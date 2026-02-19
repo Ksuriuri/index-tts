@@ -20,11 +20,16 @@ import torchaudio.transforms as T
 from pyannote.audio import Pipeline
 
 # --- 配置 ---
-DATASET_NAME = "Galgame-VisualNovel-Reupload"
+# DATASET_NAME = "Galgame-VisualNovel-Reupload"
 # DATASET_NAME = "Gacha_games_jp"
 # DATASET_NAME = "Emilia_JA"
 # DATASET_NAME = "Emilia-YODAS_JA"
 # DATASET_NAME = "Japanese-Eroge-Voice"
+
+DATASET_NAME = "Spanish/MLS_Spanish"
+# DATASET_NAME = "Spanish/voxpopuli"
+# DATASET_NAME = "Spanish/google-chilean-spanish"
+
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 HF_TOKEN = os.environ.get('HF_TOKEN', None)
 

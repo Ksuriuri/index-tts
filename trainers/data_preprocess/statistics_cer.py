@@ -11,10 +11,15 @@ from tqdm import tqdm
 # DATASET_NAME = "Gacha_games_jp"
 # DATASET_NAME = "Emilia_JA"
 # DATASET_NAME = "Emilia-YODAS_JA"
-DATASET_NAME = "Japanese-Eroge-Voice"
+# DATASET_NAME = "Japanese-Eroge-Voice"
+
+# DATASET_NAME = "Spanish/MLS_Spanish"
+# DATASET_NAME = "Spanish/voxpopuli"
+DATASET_NAME = "Spanish/google-chilean-spanish"
+
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 
-PLOT_OUTPUT_PATH = f"outputs/cer_distribution_{DATASET_NAME}.png"  # 输出图片路径
+PLOT_OUTPUT_PATH = f"outputs/cer_distribution_{DATASET_NAME.replace('/', '-')}.png"  # 输出图片路径
 
 def load_cer_data(data_dir):
     """

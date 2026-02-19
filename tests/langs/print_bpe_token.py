@@ -191,7 +191,7 @@ if __name__ == "__main__":
     
     # 确保模型已加载
     tokenizer = TextTokenizer(
-        vocab_file=r"checkpoints\IndexTTS-2-vLLM\bpe.model",
+        vocab_file=r"./checkpoints/IndexTTS-2-vLLM/bpe.model",
         # vocab_file=r"checkpoints\IndexTTS-2-vLLM\japanese_bpe.model",
         normalizer=text_normalizer,
     )

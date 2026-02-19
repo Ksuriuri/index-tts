@@ -21,8 +21,11 @@ cloudflared tunnel --url http://127.0.0.1:7860
 
 conda 环境：`index-tts`
 
+### 0. 下载数据集
+- huggingface: 使用 `trainers/data_preprocess/download_hf.py` 下载
+
 ### 1. 转为标准格式
-- 使用 `trainers/data_preprocess/preprocess_xxx.py` 预处理原始数据，主要执行 ASR 并计算 CER（保存为 .parquet 格式）
+- 使用 `trainers/data_preprocess/{lang}/preprocess_xxx.py` 预处理原始数据，主要将原始数据的格式标准化、执行 ASR 并计算 CER，保存为 .parquet 格式
 - 其中，`.parquet` 文件中每行的内容如下：
 ```python
 {
@@ -38,7 +41,7 @@ conda 环境：`index-tts`
 }
 ```
 
-### 2. 计算发音级别的 CER
+### 2. （可选）计算发音级别的 CER
 - 使用 `trainers/data_preprocess/pron_cer_calc_xxx.py` 计算发音级别的 CER，追加到 .parquet 文件中
 - 具体来说，在 `whisper_large_v3` 中添加 `pron_CER` 字段，float()
 

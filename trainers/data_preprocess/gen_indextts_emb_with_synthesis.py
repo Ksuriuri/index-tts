@@ -496,7 +496,7 @@ class AudioLoaderWorker(Process):
                             audio_tensor.share_memory_()
                             
                             # 读取合成音频
-                            if not syn_audio_col[i] or len(syn_audio_col[i]) == 0:
+                            if not syn_audio_col[i] or len(syn_audio_col[i].as_py()) == 0:
                                 # 如果合成音频为空，跳过该样本
                                 continue
                             
