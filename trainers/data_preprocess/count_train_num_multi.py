@@ -17,29 +17,47 @@ sys.path.append(root_dir)
 from trainers.utils import ProcessedData
 
 # ================= 配置区域 =================
+# PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+# DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
+
+# SOURCE_NAMES = [
+#     "Emilia_JA",
+#     "Emilia-YODAS_JA",
+#     "Gacha_games_jp",
+#     "Galgame-VisualNovel-Reupload",
+#     "Japanese-Eroge-Voice"
+# ]
+
+# END_SILENCE_FILTER_NAMES = [
+#     "Emilia_JA",
+#     "Emilia-YODAS_JA",
+#     "Gacha_games_jp",
+#     # synthesis
+#     "Galgame-VisualNovel-Reupload",
+#     "Japanese-Eroge-Voice"
+# ]
+
+PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess/Spanish"
+DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_Spanish"
+
 SOURCE_NAMES = [
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    "Gacha_games_jp",
-    "Galgame-VisualNovel-Reupload",
-    "Japanese-Eroge-Voice"
+    "google-chilean-spanish",
+    "MLS_Spanish",
+    "voxpopuli",
 ]
 
 END_SILENCE_FILTER_NAMES = [
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    "Gacha_games_jp",
+    "google-chilean-spanish",
+    "MLS_Spanish",
+    "voxpopuli",
 ]
-
-DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 
 SHARD_SIZE = 40000 
 MIN_DURATION = 0
 MAX_DURATION = 36
 MIN_TEXT_TOKENS = 1
 MAX_TEXT_TOKENS = 600
-CER_THRESHOLD = 0.10
+CER_THRESHOLD = 0.20  # 0.10
 CER_TYPE = "cer"
 # CER_TYPE = "pron_CER"
 END_SILENCE_MIN = 0.0

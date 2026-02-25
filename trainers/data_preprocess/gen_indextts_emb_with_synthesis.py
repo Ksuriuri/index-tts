@@ -45,6 +45,7 @@ DATASET_ROOTS = [
 ]
 OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
+BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_bpe.model")
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
 DEVICE_NUM = 8
@@ -95,7 +96,7 @@ class DataPreprocessor(Process):
         self.device = torch.device(f"cuda")  # :{self.gpu_id}
         self.dtype = torch.float32
 
-        bpe_path = os.path.join(self.model_dir, "jp_bpe.model")
+        bpe_path = BPE_MODEL_PATH
         normalizer = TextNormalizer()
         normalizer.load()
         self.tokenizer = TextTokenizer(bpe_path, normalizer)

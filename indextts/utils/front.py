@@ -13,6 +13,7 @@ class TextNormalizer:
     _HIRAGANA_PATTERN = re.compile(r"[\u3040-\u309f]")
     _KATAKANA_PATTERN = re.compile(r"[\u30a0-\u30ff\u31f0-\u31ff\uFF66-\uFF9F]")
     _JAPANESE_PUNCT = re.compile(r"[ー〜〝〞〟・]")
+    _SPANISH_PATTERN = re.compile(r"[áéíóúüñÁÉÍÓÚÜÑ¿¡]")
 
     def __init__(self, preferred_language: str | None = None):
         self.zh_normalizer = None
@@ -64,9 +65,18 @@ class TextNormalizer:
             "』": "'",
             **self.char_rep_map,
         }
+        # 增加西班牙语标点映射
+        self.es_char_rep_map = {
+            "¿": "",   # 通常将反问号去掉
+            "¡": "",   # 通常将反叹号去掉
+            "«": "'",  # 西班牙语引号转为标准单引号
+            "»": "'",
+            **self.char_rep_map,
+        }
         self._base_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
         self._zh_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.zh_char_rep_map.keys()))
         self._jp_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.jp_char_rep_map.keys()))
+        self._es_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.es_char_rep_map.keys()))
 
     def match_email(self, email):
         # 正则表达式匹配邮箱格式：数字英文@数字英文.英文
@@ -98,6 +108,20 @@ class TextNormalizer:
 
         has_pinyin = bool(re.search(TextNormalizer.PINYIN_TONE_PATTERN, s, re.IGNORECASE))
         return has_pinyin
+
+    def is_japanese(self, text: str) -> bool:
+        if self._HIRAGANA_PATTERN.search(text) or self._KATAKANA_PATTERN.search(text):
+            return True
+        if self._JAPANESE_PUNCT.search(text):
+            return True
+        # iteration marks and katakana-hiragana prolonged sound mark
+        if any(ch in text for ch in ("々", "〆", "ゝ", "ゞ", "ゝ", "ゞ", "ー")):
+            return True
+        return False
+
+    def is_spanish(self, text: str) -> bool:
+        """检查是否包含典型的西班牙语字符或符号"""
+        return bool(self._SPANISH_PATTERN.search(text))
 
     def load(self):
         # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -137,16 +161,6 @@ class TextNormalizer:
             return ""
         return self._base_cleanup_pattern.sub(lambda x: self.char_rep_map[x.group()], text)
 
-    def is_japanese(self, text: str) -> bool:
-        if self._HIRAGANA_PATTERN.search(text) or self._KATAKANA_PATTERN.search(text):
-            return True
-        if self._JAPANESE_PUNCT.search(text):
-            return True
-        # iteration marks and katakana-hiragana prolonged sound mark
-        if any(ch in text for ch in ("々", "〆", "ゝ", "ゞ", "ゝ", "ゞ", "ー")):
-            return True
-        return False
-
     def normalize_japanese(self, text: str) -> str:
         text = text.strip()
         if not text:
@@ -155,6 +169,17 @@ class TextNormalizer:
         text = unicodedata.normalize("NFKC", text)
         text = re.sub(r"\s+", " ", text)
         text = self._jp_cleanup_pattern.sub(lambda x: self.jp_char_rep_map[x.group()], text)
+        return text.strip()
+
+    def normalize_spanish(self, text: str) -> str:
+        text = text.strip()
+        if not text:
+            return ""
+        # 如果模型不支持数字预测，可以在这里引入 num2words 进行处理，例如：
+        # from num2words import num2words; 配合正则进行替换。这里默认模型原生支持或者采用基础清洗。
+        text = unicodedata.normalize("NFKC", text)
+        text = re.sub(r"\s+", " ", text)
+        text = self._es_cleanup_pattern.sub(lambda x: self.es_char_rep_map[x.group()], text)
         return text.strip()
 
     def normalize(self, text: str, language: str | None = None) -> str:
@@ -166,6 +191,8 @@ class TextNormalizer:
                 lang = "ja"
             elif self.use_chinese(text):
                 lang = "zh"
+            elif self.is_spanish(text):  # 加入西班牙语自动识别路由
+                lang = "es"
             else:
                 lang = "en"
 
@@ -174,6 +201,11 @@ class TextNormalizer:
         if lang == "ja":
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             return self.normalize_japanese(text)
+        
+        if lang == "es":
+            text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
+            return self.normalize_spanish(text)
+            
         if lang == "zh":
             text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             replaced_text, pinyin_list = self.save_pinyin_tones(text.rstrip())
@@ -494,7 +526,7 @@ class TextTokenizer:
         "▁?",
         "▁...", # ellipsis
     ]
-    def split_sentences(self, tokenized: List[str], max_tokens_per_sentence=120) -> List[List[str]]:
+    def split_sentences(self, tokenized: List[str], max_tokens_per_sentence=120, **kwargs) -> List[List[str]]:
         return TextTokenizer.split_sentences_by_token(
             tokenized, self.punctuation_marks_tokens, max_tokens_per_sentence=max_tokens_per_sentence
         )
