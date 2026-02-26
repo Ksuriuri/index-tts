@@ -52,10 +52,10 @@ DATASET_ROOTS = [
     f"{DATASET_ROOT}/MLS_Spanish",
     f"{DATASET_ROOT}/voxpopuli",
 ]
-OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_Spanish"
+OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
 
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
-BPE_MODEL_PATH = os.path.join(MODEL_DIR, "es_bpe.model")
+BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_es_bpe.model")
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
 DEVICE_NUM = 8

@@ -193,12 +193,12 @@ if __name__ == "__main__":
     tokenizer = TextTokenizer(
         # vocab_file=r"./checkpoints/IndexTTS-2-vLLM/bpe.model",
         # vocab_file=r"checkpoints\IndexTTS-2-vLLM\japanese_bpe.model",
-        vocab_file=r"./checkpoints/IndexTTS-2-vLLM/es_bpe.model",
+        vocab_file=r"./checkpoints/IndexTTS-2-vLLM/jp_es_bpe.model",
         normalizer=text_normalizer,
     )
     
     # 导出到文件
-    export_token_mapping(tokenizer, "outputs/token_mapping_readable_es.txt")
+    export_token_mapping(tokenizer, "outputs/token_mapping_readable_jp_es.txt")
     # export_token_mapping(tokenizer, "outputs/token_mapping_readable_jp.txt")
     
     # # 如果你想查看特定范围的token，比如拼音
