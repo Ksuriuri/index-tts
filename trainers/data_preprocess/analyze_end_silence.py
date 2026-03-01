@@ -18,11 +18,17 @@ from trainers.utils import ProcessedData
 
 # ================= 配置区域 =================
 SOURCE_NAMES = [
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    "Gacha_games_jp",
-    "Galgame-VisualNovel-Reupload",
-    "Japanese-Eroge-Voice"
+    # # jp
+    # "Emilia_JA",
+    # "Emilia-YODAS_JA",
+    # "Gacha_games_jp",
+    # "Galgame-VisualNovel-Reupload",
+    # "Japanese-Eroge-Voice"
+
+    # es
+    "google-chilean-spanish",
+    "MLS_Spanish",
+    "voxpopuli",
 ]
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"

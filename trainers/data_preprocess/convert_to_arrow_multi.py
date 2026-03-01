@@ -5,6 +5,7 @@ import random
 import traceback
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from typing import Dict, List, Any, Optional
 from datasets import Dataset
 from tqdm import tqdm
@@ -16,49 +17,53 @@ from concurrent.futures import ProcessPoolExecutor
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_es_260225"
+TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_es_260228"
 
-SOURCE_NAMES = [
+SOURCE_NAMES = {
     # jp
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    # "Gacha_games_jp",
+    "Emilia_JA": 0.0,
+    "Emilia-YODAS_JA": 0.0,
+    "Gacha_games_jp": 0.10,
     # synthesis
-    "Galgame-VisualNovel-Reupload",
-    "Japanese-Eroge-Voice",
+    "Galgame-VisualNovel-Reupload": 0.0,
+    "Japanese-Eroge-Voice": 0.01,
 
     # es
-    "google-chilean-spanish",
-    "MLS_Spanish",
-    "voxpopuli",
-]
+    "google-chilean-spanish": 0.20,
+    "MLS_Spanish": 0.20,
+    "voxpopuli": 0.20,
+}
 
-END_SILENCE_FILTER_NAMES = [
+# 每个 source 单独配置尾部静音过滤范围 (min_sec, max_sec)，只有在此 dict 中的 source 才启用过滤
+END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
     # jp
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    # "Gacha_games_jp",
+    "Emilia_JA": (0.1, 0.7),
+    "Emilia-YODAS_JA": (0.1, 0.7),
+    "Gacha_games_jp": (0.1, 0.7),
     # synthesis
-    "Galgame-VisualNovel-Reupload",
-    "Japanese-Eroge-Voice",
-
+    "Galgame-VisualNovel-Reupload": (0.1, 0.7),
+    "Japanese-Eroge-Voice": (0.1, 0.7),
     # es
-    "google-chilean-spanish",
-    "MLS_Spanish",
-    "voxpopuli",
-]
-
+    "google-chilean-spanish": (0.0, 0.7),
+    "MLS_Spanish": (0.0, 0.7),
+    "voxpopuli": (0.0, 0.7),
+}
 
 SHARD_SIZE = 40000 
 MIN_DURATION = 0
 MAX_DURATION = 36
 MIN_TEXT_TOKENS = 1
 MAX_TEXT_TOKENS = 600
-CER_THRESHOLD = 0.20  # 0.10 for jp, 0.20 for Spanish
-CER_TYPE = "cer"
+CER_TYPE = "cer"  # 默认 CER 类型，可被 SOURCE_CER_TYPES 覆盖
 # CER_TYPE = "pron_CER"
-END_SILENCE_MIN = 0.0
-END_SILENCE_MAX = 0.7  # 0.5
+# 每个 source 可单独指定 CER 类型，未在此处的 source 使用上面的 CER_TYPE
+SOURCE_CER_TYPES: Dict[str, str] = {
+    "Emilia_JA": "pron_CER",
+    "Emilia-YODAS_JA": "pron_CER",
+    "Gacha_games_jp": "pron_CER",
+    "Galgame-VisualNovel-Reupload": "pron_CER",
+    "Japanese-Eroge-Voice": "pron_CER",
+}
 
 # 并行配置
 NUM_WORKERS = 8  # max(1, multiprocessing.cpu_count() - 4) # 预留核心给系统和Saver
@@ -94,7 +99,7 @@ def process_single_file(args):
     这是 Worker 进程执行的函数。
     读取一个文件，返回过滤后的 valid_items 列表。
     """
-    file_path, source_name = args
+    file_path, source_name, cer_threshold, cer_type = args
     valid_items = []
     stats = {"cer_skip": 0, "diar_skip": 0, "not_silence_skip": 0, "processed": 1}
 
@@ -103,9 +108,10 @@ def process_single_file(args):
         if not parquet_path or not os.path.exists(parquet_path):
             return [], stats
 
-        # 优化：只读取需要的列
         try:
-            df_meta = pd.read_parquet(parquet_path, columns=["whisper_large_v3", "speaker", "speaker_diarization"])
+            pf = pq.ParquetFile(parquet_path)
+            meta_len = pf.metadata.num_rows
+            batch_iterator = pf.iter_batches(batch_size=256, columns=["whisper_large_v3", "speaker", "speaker_diarization"])
         except Exception:
             return [], stats
 
@@ -115,31 +121,62 @@ def process_single_file(args):
         if not data_list:
             return [], stats
 
-        for item in data_list:
-            processed_data: ProcessedData = item["data"]
+        # 确保按 index 升序，以便与 iter_batches 顺序遍历匹配
+        data_list.sort(key=lambda x: x["index"])
+
+        current_batch = None
+        batch_start = 0
+        batch_end = 0
+
+        data_idx = 0
+        num_data = len(data_list)
+
+        while data_idx < num_data:
+            item = data_list[data_idx]
             parquet_idx = item["index"]
+            processed_data: ProcessedData = item["data"]
             
             # 安全检查索引越界
-            if parquet_idx >= len(df_meta):
+            if parquet_idx >= meta_len:
+                data_idx += 1
                 continue
                 
-            row = df_meta.iloc[parquet_idx]
+            while parquet_idx >= batch_end:
+                try:
+                    batch = next(batch_iterator)
+                    current_batch = batch.to_pydict()
+                    batch_start = batch_end
+                    batch_end += batch.num_rows
+                except StopIteration:
+                    break
+                    
+            if parquet_idx >= batch_end:
+                break
+                
+            local_idx = parquet_idx - batch_start
+            
+            # 从 batch 字典获取对应行，处理可能缺少的列
+            whisper_info = current_batch.get("whisper_large_v3", [{}])[local_idx] if "whisper_large_v3" in current_batch else {}
+            speaker_diar = current_batch.get("speaker_diarization", [[]])[local_idx] if "speaker_diarization" in current_batch else []
+            raw_speaker = current_batch.get("speaker", [None])[local_idx] if "speaker" in current_batch else None
+            
+            data_idx += 1
 
             # CER 过滤
-            whisper_info = row["whisper_large_v3"]
-            cer = whisper_info.get(CER_TYPE, 1.0)
-            if cer > CER_THRESHOLD:
+            cer = whisper_info.get(cer_type, 1.0)
+            if cer > cer_threshold:
                 stats["cer_skip"] += 1
                 continue
 
             # Diarization 过滤
-            unique_speakers = set(seg['speaker'] for seg in row["speaker_diarization"])
+            unique_speakers = set(seg.get('speaker', '') if isinstance(seg, dict) else seg['speaker'] for seg in speaker_diar)
             if len(unique_speakers) != 1:
                 stats["diar_skip"] += 1
                 continue
             
             # 尾部静音过滤
-            if source_name in END_SILENCE_FILTER_NAMES:
+            if source_name in END_SILENCE_FILTER:
+                end_silence_min, end_silence_max = END_SILENCE_FILTER[source_name]
                 total_duration = processed_data.duration
                 segments = list(whisper_info.get("segments", []))
                 
@@ -147,14 +184,13 @@ def process_single_file(args):
                 if segments:
                     last_seg_end = segments[-1]["end"]
                     tail_gap = total_duration - last_seg_end
-                    if END_SILENCE_MIN <= tail_gap <= END_SILENCE_MAX:
+                    if end_silence_min <= tail_gap <= end_silence_max:
                         skip_flag = False
                 if skip_flag:
                     stats["not_silence_skip"] += 1
                     continue
 
             # Speaker ID 生成
-            raw_speaker = row.get("speaker", None)
             if raw_speaker is not None:
                 spk_id = str(raw_speaker)
             else:
@@ -251,15 +287,16 @@ def main():
 
     # 1. 收集所有任务
     all_tasks = []
-    for source_name in SOURCE_NAMES:
+    for source_name, cer_threshold in SOURCE_NAMES.items():
         source_dir = os.path.join(DATA_ROOT, source_name)
         if not os.path.exists(source_dir):
             continue
+        cer_type = SOURCE_CER_TYPES.get(source_name, CER_TYPE)
         files = get_all_pkl_files(source_dir)
-        print(f"Source: {source_name}, Files: {len(files)}")
+        print(f"Source: {source_name}, Files: {len(files)}, CER_TYPE: {cer_type}")
         # 将参数打包，方便 map 调用
         for f in files:
-            all_tasks.append((f, source_name))
+            all_tasks.append((f, source_name, cer_threshold, cer_type))
 
     # 打乱文件处理顺序，防止某种特定类型数据扎堆（可选）
     random.shuffle(all_tasks) 
@@ -278,9 +315,12 @@ def main():
     
     # 使用 imap_unordered 提高响应速度，谁处理完就先返回谁
     with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
-        pbar = tqdm(pool.imap_unordered(process_single_file, all_tasks, chunksize=10), 
-                   total=len(all_tasks), desc="Processing")
-        
+        pbar = tqdm(
+            pool.imap_unordered(process_single_file, all_tasks, chunksize=10),
+            total=len(all_tasks),
+            desc="文件处理中",
+            unit="文件",
+        )
         for result_items, stats in pbar:
             if result_items:
                 pending_items.extend(result_items)
