@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint directory to resume from (accelerate style), or empty.")
     parser.add_argument("--use-duration-control", action="store_true", help="Train GPT with duration embeddings.")
     parser.add_argument("--duration-dropout", type=float, default=0.3, help="Probability of zeroing duration embeddings.")
+    parser.add_argument("--no-emo-vec", action="store_true", help="Disable emotion vector in conditioning (default: use emo_vec).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     
     # WandB configs
@@ -150,11 +151,12 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
 
 
 class GPTLossWrapper(nn.Module):
-    def __init__(self, model: UnifiedVoice, use_duration_control: bool = False, duration_dropout: float = 0.3):
+    def __init__(self, model: UnifiedVoice, use_duration_control: bool = False, duration_dropout: float = 0.3, use_emo_vec: bool = True):
         super().__init__()
         self.model = model
         self.use_duration_control = use_duration_control
         self.duration_dropout = duration_dropout
+        self.use_emo_vec = use_emo_vec
 
     def forward(self, batch: Dict[str, torch.Tensor]):
         target_device = batch["text_ids"].device
@@ -190,8 +192,9 @@ class GPTLossWrapper(nn.Module):
                     duration_ctrl = torch.where(drop_mask.unsqueeze(1), duration_free, duration_ctrl)
         else:
             duration_ctrl = self.model.speed_emb(torch.ones_like(use_speed))
+        cond_input = (condition + emo_vec.unsqueeze(1)) if self.use_emo_vec else condition
         conds = torch.cat(
-            (condition + emo_vec.unsqueeze(1), duration_ctrl.unsqueeze(1), duration_free.unsqueeze(1)),
+            (cond_input, duration_ctrl.unsqueeze(1), duration_free.unsqueeze(1)),
             dim=1,
         )
 
@@ -434,9 +437,10 @@ def main() -> None:
             param.requires_grad = False
 
     model = GPTLossWrapper(
-        model, 
+        model,
         use_duration_control=args.use_duration_control,
-        duration_dropout=args.duration_dropout
+        duration_dropout=args.duration_dropout,
+        use_emo_vec=not args.no_emo_vec,
     )
 
     full_dataset = ArrowJapaneseGPTDataset(args.train_data_dirs)

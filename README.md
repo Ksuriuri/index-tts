@@ -50,7 +50,7 @@ conda 环境：`index-tts`
 - 具体来说，添加了 `speaker_diarization` 字段：`[{"speaker": str, "start": float, "end": float}, ...]`
 
 ### 3.5. 为无说话人标签数据生成参考音频
-- 使用 `trainers/data_preprocess/speaker_synthesis_indextts_jp.py`: 为无说话人标签数据生成参考音频，保存为同目录结构且同名的 .parquet 文件中仅保存 `audio` 和 `text` 字段
+- 使用 `trainers/data_preprocess/speaker_synthesis.py`: 为无说话人标签数据生成参考音频，保存为同目录结构且同名的 .parquet 文件中仅保存 `audio` 和 `text` 字段
 - 当前过滤条件：1. 原音频大于6秒且小于36秒；2. pron_CE小于0.5；3. 音频中仅有一个说话人
 - 生成文本：提取原文件中长度小于100且大于10的文本组成数组，从中随机选择
 

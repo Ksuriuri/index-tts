@@ -21,7 +21,7 @@ import soundfile as sf
 DATASET_NAME = "Galgame-VisualNovel-Reupload"
 # DATASET_NAME = "Japanese-Eroge-Voice"
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
-OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/synthesis_data/{DATASET_NAME}_indextts_jp"
+OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/synthesis_data/{DATASET_NAME}"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MIN_AUDIO_DURATION = 3  # 6

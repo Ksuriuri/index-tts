@@ -415,7 +415,7 @@ class AudioLoaderWorker(Process):
         dataset_name = rel_path.split(os.sep)[0]
         
         # 构建合成音频路径
-        synthesis_dataset_name = f"{dataset_name}_indextts_jp"
+        synthesis_dataset_name = f"{dataset_name}"
         synthesis_rel_path = os.path.join(synthesis_dataset_name, os.sep.join(rel_path.split(os.sep)[1:]))
         synthesis_path = os.path.join(SYNTHESIS_ROOT, synthesis_rel_path)
         

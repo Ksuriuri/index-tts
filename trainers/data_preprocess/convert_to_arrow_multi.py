@@ -17,21 +17,21 @@ from concurrent.futures import ProcessPoolExecutor
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_es_260228"
+TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_260319"
 
 SOURCE_NAMES = {
     # jp
-    "Emilia_JA": 0.0,
-    "Emilia-YODAS_JA": 0.0,
-    "Gacha_games_jp": 0.10,
+    "Emilia_JA": 0.15,
+    "Emilia-YODAS_JA": 0.15,
+    "Gacha_games_jp": 0.20,
     # synthesis
-    "Galgame-VisualNovel-Reupload": 0.0,
-    "Japanese-Eroge-Voice": 0.01,
+    "Galgame-VisualNovel-Reupload": 0.10,
+    "Japanese-Eroge-Voice": 0.10,
 
-    # es
-    "google-chilean-spanish": 0.20,
-    "MLS_Spanish": 0.20,
-    "voxpopuli": 0.20,
+    # # es
+    # "google-chilean-spanish": 0.20,
+    # "MLS_Spanish": 0.20,
+    # "voxpopuli": 0.20,
 }
 
 # 每个 source 单独配置尾部静音过滤范围 (min_sec, max_sec)，只有在此 dict 中的 source 才启用过滤
@@ -43,10 +43,11 @@ END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
     # synthesis
     "Galgame-VisualNovel-Reupload": (0.1, 0.7),
     "Japanese-Eroge-Voice": (0.1, 0.7),
-    # es
-    "google-chilean-spanish": (0.0, 0.7),
-    "MLS_Spanish": (0.0, 0.7),
-    "voxpopuli": (0.0, 0.7),
+
+    # # es
+    # "google-chilean-spanish": (0.0, 0.7),
+    # "MLS_Spanish": (0.0, 0.7),
+    # "voxpopuli": (0.0, 0.7),
 }
 
 SHARD_SIZE = 40000 
@@ -64,6 +65,13 @@ SOURCE_CER_TYPES: Dict[str, str] = {
     "Galgame-VisualNovel-Reupload": "pron_CER",
     "Japanese-Eroge-Voice": "pron_CER",
 }
+
+# 控制哪些 source 可以使用 emo_vec（USE_EMO_VEC_PROB 的概率保留，否则置零），不在列表中的 source 全部置零
+USE_EMO_VEC_PROB = 0.5
+EMO_VEC_SOURCES: List[str] = [
+    "Galgame-VisualNovel-Reupload",
+    "Japanese-Eroge-Voice",
+]
 
 # 并行配置
 NUM_WORKERS = 8  # max(1, multiprocessing.cpu_count() - 4) # 预留核心给系统和Saver
@@ -203,6 +211,12 @@ def process_single_file(args):
 
             processed_data_np = processed_data.to_numpy()
 
+            if source_name in EMO_VEC_SOURCES:
+                if random.random() > USE_EMO_VEC_PROB:
+                    processed_data_np.emo_vec = np.zeros_like(processed_data_np.emo_vec)
+            else:
+                processed_data_np.emo_vec = np.zeros_like(processed_data_np.emo_vec)
+
             valid_items.append({
                 'data': processed_data_np,
                 'speaker_id': spk_id
@@ -246,7 +260,7 @@ def save_shard_task(data_items: List[Dict], shard_index: int, output_dir: str):
         # --- 构建 Dataset ---
         buffer = defaultdict(list)
         # 显式列出字段，比 append 更快一点
-        keys = ["text_ids", "codes", "text_len", "code_len", "condition", "emo_vec", "duration"]
+        # keys = ["text_ids", "codes", "text_len", "code_len", "condition", "emo_vec", "duration"]
         
         for item in data_items:
             np_obj = item['data']

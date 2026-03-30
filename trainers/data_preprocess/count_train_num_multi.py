@@ -23,17 +23,17 @@ DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
 
 SOURCE_NAMES = {
     # jp
-    "Emilia_JA": 0.0,
-    "Emilia-YODAS_JA": 0.0,
-    "Gacha_games_jp": 0.10,
+    "Emilia_JA": 0.15,
+    "Emilia-YODAS_JA": 0.15,
+    "Gacha_games_jp": 0.20,
     # synthesis
-    "Galgame-VisualNovel-Reupload": 0.0,
-    "Japanese-Eroge-Voice": 0.01,
+    "Galgame-VisualNovel-Reupload": 0.10,
+    "Japanese-Eroge-Voice": 0.10,
 
-    # es
-    "google-chilean-spanish": 0.20,
-    "MLS_Spanish": 0.20,
-    "voxpopuli": 0.20,
+    # # es
+    # "google-chilean-spanish": 0.20,
+    # "MLS_Spanish": 0.20,
+    # "voxpopuli": 0.20,
 }
 
 # 每个 source 单独配置尾部静音过滤范围 (min_sec, max_sec)，只有在此 dict 中的 source 才启用过滤
@@ -45,10 +45,11 @@ END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
     # synthesis
     "Galgame-VisualNovel-Reupload": (0.1, 0.7),
     "Japanese-Eroge-Voice": (0.1, 0.7),
-    # es
-    "google-chilean-spanish": (0.0, 0.7),
-    "MLS_Spanish": (0.0, 0.7),
-    "voxpopuli": (0.0, 0.7),
+    
+    # # es
+    # "google-chilean-spanish": (0.0, 0.7),
+    # "MLS_Spanish": (0.0, 0.7),
+    # "voxpopuli": (0.0, 0.7),
 }
 
 SHARD_SIZE = 40000 
