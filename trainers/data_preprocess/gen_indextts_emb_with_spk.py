@@ -38,24 +38,26 @@ from trainers.utils import ProcessedData
 
 random.seed(42)
 
-# DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
-# DATASET_ROOTS = [
-#     f"{DATASET_ROOT}/Emilia_JA",
-#     f"{DATASET_ROOT}/Emilia-YODAS_JA",
-#     f"{DATASET_ROOT}/Gacha_games_jp",
-# ]
-# OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
-
-DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess/Spanish"
+DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATASET_ROOTS = [
-    f"{DATASET_ROOT}/google-chilean-spanish",
-    f"{DATASET_ROOT}/MLS_Spanish",
-    f"{DATASET_ROOT}/voxpopuli",
+    f"{DATASET_ROOT}/Emilia_JA",
+    f"{DATASET_ROOT}/Emilia-YODAS_JA",
+    f"{DATASET_ROOT}/Gacha_games_jp",
 ]
+
+# DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess/Spanish"
+# DATASET_ROOTS = [
+#     f"{DATASET_ROOT}/google-chilean-spanish",
+#     f"{DATASET_ROOT}/MLS_Spanish",
+#     f"{DATASET_ROOT}/voxpopuli",
+# ]
+
+EMO_SYNTHESIS_ROOT = "/mnt/data_3t_1/datasets/preprocess/emo_synthesis_data"
+
 OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
 
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
-BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_es_bpe.model")
+BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_bpe.model")
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
 DEVICE_NUM = 8
@@ -71,6 +73,7 @@ TARGET_SR = 16000
 class DataPreprocessorReqData:
     text: str
     audio: torch.Tensor
+    emo_audio: torch.Tensor
     orig_sr: int
     file_rel_path: str
     original_index: int
@@ -159,7 +162,7 @@ class DataPreprocessor(Process):
         try:
             fake_audio = torch.zeros(16000, dtype=torch.float32)
             fake_text = "123"
-            self.preprocess(fake_text, fake_audio)
+            self.preprocess(fake_text, fake_audio, fake_audio)
         except Exception as e:
             logger.error(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] healthy check error: {e}')
             return False
@@ -200,6 +203,7 @@ class DataPreprocessor(Process):
         texts = [d.text for d in input_data_list]
         
         audio_tensors = []
+        emo_audio_tensors = []
         for d in input_data_list:
             # wav = torch.from_numpy(d.audio)
             wav = d.audio
@@ -208,8 +212,15 @@ class DataPreprocessor(Process):
                 resampler = self.get_resampler(d.orig_sr)
                 wav = resampler(wav)
             audio_tensors.append(wav)
+            
+            emo_wav = d.emo_audio
+            if d.orig_sr != TARGET_SR:
+                emo_wav = emo_wav.to(self.device, non_blocking=True)
+                resampler = self.get_resampler(d.orig_sr)
+                emo_wav = resampler(emo_wav)
+            emo_audio_tensors.append(emo_wav)
         
-        processed_datas = self.preprocess_batch(texts, audio_tensors)
+        processed_datas = self.preprocess_batch(texts, audio_tensors, emo_audio_tensors)
         
         results = []
         for i, p_data in enumerate(processed_datas):
@@ -233,9 +244,11 @@ class DataPreprocessor(Process):
         self,
         text: str,
         audio: torch.Tensor,
+        emo_audio: torch.Tensor,
     ):
         """
         audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
+        emo_audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
         """
         duration = audio.shape[0] / 16000
         # Tokenize Text
@@ -260,12 +273,20 @@ class DataPreprocessor(Process):
         semantic_code = semantic_code.squeeze(0)
         code_len = semantic_code.shape[0]
 
-        # Get Conditioning & Emotion Vector
+        # Get Conditioning
         feat_t = spk_cond_emb.transpose(1, 2)
         cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
         
         conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device).squeeze(0)  # [32, 1280]
-        emo_vec = self.gpt.get_emovec(spk_cond_emb, cond_lengths_device).squeeze(0)  # [1280]
+        
+        # emo_vec: 全部使用情感音频
+        inputs_emo = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+        input_features_emo = inputs_emo["input_features"].to(self.device)
+        attention_mask_emo = inputs_emo["attention_mask"].to(self.device)
+        spk_cond_emb_emo = self.get_emb(input_features_emo, attention_mask_emo)
+        cond_lengths_emo = attention_mask_emo.sum(dim=1).long()
+        cond_lengths_device_emo = cond_lengths_emo.to(spk_cond_emb_emo.device)
+        emo_vec = self.gpt.get_emovec(spk_cond_emb_emo, cond_lengths_device_emo).squeeze(0)  # [1280]
 
         processed_data = ProcessedData(
             text_ids=text_ids.to(device="cpu", dtype=torch.int16),
@@ -283,9 +304,11 @@ class DataPreprocessor(Process):
         self,
         texts: List[str],
         audios: List[torch.Tensor],
+        emo_audios: List[torch.Tensor],
     ):
         """
         audio: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
+        emo_audios: torch.Tensor, [audio_len], sampling_rate=16000, torch.float32, [-1, 1]
         """
         batch_size = len(texts)
         durations = [audio.shape[0] / 16000 for audio in audios]
@@ -321,12 +344,22 @@ class DataPreprocessor(Process):
             semantic_codes.append(semantic_code_)
             code_lens.append(semantic_code_.shape[0])
 
-        # Get Conditioning & Emotion Vector
+        # Get Conditioning
         feat_t = spk_cond_emb.transpose(1, 2)
         cond_lengths_device = cond_lengths.to(spk_cond_emb.device)
         
         conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device)  # [b, 32, 1280]
-        emo_vec = self.gpt.get_emovec(spk_cond_emb, cond_lengths_device)  # [b, 1280]
+        
+        # Extract Features for emo audios
+        inputs_emo = self.extract_features([a.cpu().numpy() for a in emo_audios], sampling_rate=16000, return_tensors="pt")
+        input_features_emo = inputs_emo["input_features"].to(self.device)
+        attention_mask_emo = inputs_emo["attention_mask"].to(self.device)
+        
+        spk_cond_emb_emo = self.get_emb(input_features_emo, attention_mask_emo)
+        cond_lengths_emo = attention_mask_emo.sum(dim=1).long()
+        cond_lengths_device_emo = cond_lengths_emo.to(spk_cond_emb_emo.device)
+        
+        emo_vec = self.gpt.get_emovec(spk_cond_emb_emo, cond_lengths_device_emo)  # [b, 1280]
 
         conditioning = conditioning.to(device="cpu", dtype=torch.float16)
         emo_vec = emo_vec.to(device="cpu", dtype=torch.float16)
@@ -362,6 +395,19 @@ class AudioLoaderWorker(Process):
         self.writer_control_queue = writer_control_queue
         self.worker_id = worker_id
 
+    def get_emo_synthesis_path(self, original_parquet_path):
+        """
+        根据原始parquet路径获取对应的情感音频parquet路径
+        """
+        rel_path = os.path.relpath(original_parquet_path, DATASET_ROOT)
+        dataset_name = rel_path.split(os.sep)[0]
+        
+        emo_synthesis_dataset_name = f"{dataset_name}"
+        emo_synthesis_rel_path = os.path.join(emo_synthesis_dataset_name, os.sep.join(rel_path.split(os.sep)[1:]))
+        emo_synthesis_path = os.path.join(EMO_SYNTHESIS_ROOT, emo_synthesis_rel_path)
+        
+        return emo_synthesis_path
+
     def run(self):
         logger.info(f"[CPU-Loader-{self.worker_id}] Started.")
         batch_req = []
@@ -382,7 +428,20 @@ class AudioLoaderWorker(Process):
                     logger.error(f"[CPU-Loader-{self.worker_id}] Skipping {rel_path} as it already exists.")
                     continue
 
+                emo_synthesis_parquet_path = self.get_emo_synthesis_path(parquet_path)
+                if not os.path.exists(emo_synthesis_parquet_path):
+                    logger.warning(f"[CPU-Loader-{self.worker_id}] Emo synthesis file not found: {emo_synthesis_parquet_path}, skipping {rel_path}")
+                    continue
+
                 parquet_file = pq.ParquetFile(parquet_path)
+                emo_synthesis_parquet_file = pq.ParquetFile(emo_synthesis_parquet_path)
+                
+                orig_num_rows = parquet_file.metadata.num_rows
+                emo_num_rows = emo_synthesis_parquet_file.metadata.num_rows
+                if orig_num_rows != emo_num_rows:
+                    logger.warning(f"[CPU-Loader-{self.worker_id}] Row count mismatch: original={orig_num_rows}, emo_synthesis={emo_num_rows}, skipping {rel_path}")
+                    continue
+                
                 valid_count = 0
                 duration_skip_num = 0
                 non_audio_or_text_skip_num = 0
@@ -391,9 +450,12 @@ class AudioLoaderWorker(Process):
 
                 global_row_offset = 0 
 
-                for batch in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text']):
+                orig_batches = parquet_file.iter_batches(batch_size=256, columns=['audio', 'text'])
+                emo_batches = emo_synthesis_parquet_file.iter_batches(batch_size=256, columns=['audio', 'text'])
+                for batch, emo_batch in zip(orig_batches, emo_batches):
                     audio_col = batch['audio']
                     text_col = batch['text']
+                    emo_audio_col = emo_batch['audio']
                     batch_len = len(batch)
 
                     for i in range(batch_len):
@@ -415,9 +477,22 @@ class AudioLoaderWorker(Process):
                             audio_tensor = torch.from_numpy(array).float()
                             audio_tensor.share_memory_()
                             
+                            if not emo_audio_col[i] or len(emo_audio_col[i].as_py()) == 0:
+                                continue
+                            
+                            emo_array, emo_sampling_rate = sf.read(io.BytesIO(emo_audio_col[i]), dtype='float32')
+                            if emo_array.ndim > 1:
+                                emo_array = np.mean(emo_array, axis=1)
+                            if len(emo_array) == 0:
+                                continue
+                            
+                            emo_audio_tensor = torch.from_numpy(emo_array).float()
+                            emo_audio_tensor.share_memory_()
+
                             req = DataPreprocessorReqData(
                                 text=text,
                                 audio=audio_tensor,  # float32
+                                emo_audio=emo_audio_tensor,  # float32
                                 orig_sr=sampling_rate,
                                 file_rel_path=rel_path,
                                 original_index=current_file_index

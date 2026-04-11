@@ -7,7 +7,7 @@ accelerate launch \
     --tokenizer checkpoints/IndexTTS-2-vLLM/jp_bpe.model \
     --base-checkpoint checkpoints/IndexTTS-2-vLLM/gpt.pth \
     --train-data-dir \
-    /mnt/data_3t_2/datasets/final_train_data/jp_260319 \
+    /mnt/data_3t_2/datasets/final_train_data/jp_260402 \
     --val-data-size 128 \
     --output-dir ./trained_ckpts \
     --batch-size-per-device 4 \
@@ -23,5 +23,5 @@ accelerate launch \
     --use-duration-control \
     --duration-dropout 0.3 \
     --wandb-project "IndexTTS2-jp" \
-    --wandb-run-name "e2_half_emo_vec_260319"
+    --wandb-run-name "jp_e2_emo_vec_260402"
     # --no-emo-vec \

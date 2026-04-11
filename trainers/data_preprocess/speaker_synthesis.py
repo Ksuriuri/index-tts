@@ -24,13 +24,18 @@ DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/synthesis_data/{DATASET_NAME}"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# --- 加载 TTS 文本（与 emo_synthesis 一致，使用 txt 中的行） ---
+TTS_TEXTS = []
+with open("/mnt/data_sdd/hhy/index-tts/assets/tts_dataset.txt", "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            TTS_TEXTS.append(line)
+
 MIN_AUDIO_DURATION = 3  # 6
 MAX_AUDIO_DURATION = 30  # 36
 
-MIN_TEXT_LEN = 10
-MAX_TEXT_LEN = 50
-
-CER_THRESHOLD = 0.30  # 0.10
+CER_THRESHOLD = 0.20  # 0.10
 # CER_TYPE = "cer"
 CER_TYPE = "pron_CER"
 
@@ -98,7 +103,7 @@ class TTSWorker(Process):
         # 启动异步事件循环
         asyncio.run(self._run_async())
 
-    async def _process_single_row(self, session, port_queue, current_port_id, idx, row_data, filtered_list, df, pbar):
+    async def _process_single_row(self, session, port_queue, current_port_id, idx, row_data, df, pbar):
         """
         处理单行数据的异步任务
         """
@@ -127,8 +132,8 @@ class TTSWorker(Process):
                 df.at[idx, 'text'] = ""
                 return
 
-            # 3. 准备文本和请求
-            syn_text = random.choice(filtered_list)
+            # 3. 准备文本和请求（与 emo_synthesis 一致，从 txt 词表随机选取）
+            syn_text = random.choice(TTS_TEXTS)
             
             # 4. 发送请求，使用分配到的 current_port_id
             new_audio = await tts_gen_async(session, syn_text, audio_bytes, current_port_id)
@@ -181,9 +186,6 @@ class TTSWorker(Process):
                     df = pd.read_parquet(parquet_path)
                     df['origin_idx'] = df.index
                     df['text'] = df['text'].astype(str)
-                    
-                    mask = (df['text'].str.len() >= MIN_TEXT_LEN) & (df['text'].str.len() <= MAX_TEXT_LEN)
-                    filtered_list = df.loc[mask, 'text'].tolist()
 
                     file_pbar = tqdm(
                         total=len(df), 
@@ -218,8 +220,8 @@ class TTSWorker(Process):
                         row_data = {'audio': df.at[idx, 'audio']}
                         task = asyncio.create_task(
                             self._process_single_row(
-                                session, port_queue, current_port_id, 
-                                idx, row_data, filtered_list, df, file_pbar
+                                session, port_queue, current_port_id,
+                                idx, row_data, df, file_pbar
                             )
                         )
                         tasks.append(task)

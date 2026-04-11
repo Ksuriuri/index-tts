@@ -54,6 +54,9 @@ conda 环境：`index-tts`
 - 当前过滤条件：1. 原音频大于6秒且小于36秒；2. pron_CE小于0.5；3. 音频中仅有一个说话人
 - 生成文本：提取原文件中长度小于100且大于10的文本组成数组，从中随机选择
 
+### 3.6 生成情感参考音频
+- 使用 `trainers/data_preprocess/emo_synthesis.py`
+
 ### 4. 预处理训练数据
 使用 `trainers/data_preprocess/gen_indextts_emb_xxx.py`: 预处理训练数据：生成 embedding 和 token id（.pkl 格式）
 - 其中，`.pkl` 文件与原 `.parquet` 一一对应，内容为 `List[Dict[str, Any]]`，具体是 `[{"index": int, "data": ProcessedData}]`，`ProcessedData` 参考 `trainers.utils`

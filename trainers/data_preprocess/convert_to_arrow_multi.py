@@ -17,16 +17,16 @@ from concurrent.futures import ProcessPoolExecutor
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_260319"
+TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_260402"
 
 SOURCE_NAMES = {
     # jp
-    "Emilia_JA": 0.15,
+    # "Emilia_JA": 0.15,
     "Emilia-YODAS_JA": 0.15,
-    "Gacha_games_jp": 0.20,
-    # synthesis
-    "Galgame-VisualNovel-Reupload": 0.10,
-    "Japanese-Eroge-Voice": 0.10,
+    # "Gacha_games_jp": 0.20,
+    # # synthesis
+    # "Galgame-VisualNovel-Reupload": 0.10,
+    # "Japanese-Eroge-Voice": 0.10,
 
     # # es
     # "google-chilean-spanish": 0.20,
@@ -67,8 +67,9 @@ SOURCE_CER_TYPES: Dict[str, str] = {
 }
 
 # 控制哪些 source 可以使用 emo_vec（USE_EMO_VEC_PROB 的概率保留，否则置零），不在列表中的 source 全部置零
-USE_EMO_VEC_PROB = 0.5
+USE_EMO_VEC_PROB = 1.0  # 0.5
 EMO_VEC_SOURCES: List[str] = [
+    "Emilia-YODAS_JA"
     "Galgame-VisualNovel-Reupload",
     "Japanese-Eroge-Voice",
 ]
@@ -202,6 +203,7 @@ def process_single_file(args):
             if raw_speaker is not None:
                 spk_id = str(raw_speaker)
             else:
+                # 无特殊意义，仅为了标识唯一说话人，防止不同数据集混淆
                 spk_id = f"{source_name}_idx_{parquet_idx}"
 
             # 时长/长度过滤

@@ -18,7 +18,10 @@ from torch.multiprocessing import Process, Queue, Value
 import soundfile as sf
 
 
-DATASET_NAME = "Galgame-VisualNovel-Reupload"
+# DATASET_NAME = "Emilia_JA"
+# DATASET_NAME = "Emilia-YODAS_JA"
+DATASET_NAME = "Gacha_games_jp"
+# DATASET_NAME = "Galgame-VisualNovel-Reupload"
 # DATASET_NAME = "Japanese-Eroge-Voice"
 
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
