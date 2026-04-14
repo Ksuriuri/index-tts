@@ -25,6 +25,7 @@ mp.set_sharing_strategy('file_system')
 import safetensors
 from omegaconf import OmegaConf
 from transformers import SeamlessM4TFeatureExtractor
+from typing import List as _List
 
 # 原始路径设置
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,6 +69,108 @@ BATCH_SIZE = 12
 
 
 TARGET_SR = 16000
+
+
+class GPUFeatureExtractor(torch.nn.Module):
+    """
+    GPU-based replacement for SeamlessM4TFeatureExtractor.
+    Replicates the exact same computation (Kaldi-style fbank) using batched
+    PyTorch ops on GPU, eliminating the numpy per-frame Python for-loop.
+    """
+
+    def __init__(self, mel_filters_np, window_np, num_mel_bins=80, stride=2):
+        super().__init__()
+        self.num_mel_bins = num_mel_bins
+        self.stride = stride
+        self.frame_length = 400
+        self.hop_length = 160
+        self.fft_length = 512
+        self.preemphasis_coeff = 0.97
+        self.mel_floor = 1.192092955078125e-07
+        self.scale = float(2 ** 15)
+
+        self.register_buffer('window', torch.from_numpy(window_np).float())
+        self.register_buffer('mel_filters', torch.from_numpy(mel_filters_np).float())
+
+    @torch.no_grad()
+    def forward(self, audios: _List[torch.Tensor]) -> dict:
+        """
+        Args:
+            audios: list of 1D GPU tensors, float32, values in [-1, 1], sr=16000
+        Returns:
+            dict with input_features [B, T//stride, mel*stride] and
+            attention_mask [B, T//stride], both on GPU.
+        """
+        device = audios[0].device
+        batch_size = len(audios)
+        lengths = [a.shape[0] for a in audios]
+        max_len = max(lengths)
+
+        padded = torch.zeros(batch_size, max_len, device=device)
+        for i, a in enumerate(audios):
+            padded[i, :lengths[i]] = a
+
+        padded = padded * self.scale
+
+        # [B, num_frames, frame_length]
+        frames = padded.unfold(1, self.frame_length, self.hop_length)
+        frame_counts = [(l - self.frame_length) // self.hop_length + 1 for l in lengths]
+        max_valid = max(frame_counts)
+        frames = frames[:, :max_valid, :]
+
+        # DC offset removal
+        frames = frames - frames.mean(dim=2, keepdim=True)
+
+        # Pre-emphasis
+        preemph = torch.empty_like(frames)
+        preemph[:, :, 0] = frames[:, :, 0] * (1.0 - self.preemphasis_coeff)
+        preemph[:, :, 1:] = frames[:, :, 1:] - self.preemphasis_coeff * frames[:, :, :-1]
+
+        # Window
+        preemph = preemph * self.window
+
+        # Zero-pad to fft_length → rfft → power spectrum
+        padded_frames = torch.nn.functional.pad(
+            preemph, (0, self.fft_length - self.frame_length)
+        )
+        power = torch.fft.rfft(padded_frames).abs().square()  # [B, T, 257]
+
+        # Mel filterbank + log
+        mel = torch.matmul(power, self.mel_filters)             # [B, T, 80]
+        mel = torch.clamp(mel, min=self.mel_floor)
+        mel = torch.log(mel)
+
+        # Attention mask for valid frames
+        arange = torch.arange(max_valid, device=device).unsqueeze(0)  # [1, T]
+        fc_tensor = torch.tensor(frame_counts, device=device).unsqueeze(1)  # [B, 1]
+        attention_mask = (arange < fc_tensor).long()  # [B, T]
+
+        # Per-mel-bin normalization  (zero-mean, unit-var with ddof=1)
+        for i in range(batch_size):
+            fc = frame_counts[i]
+            seg = mel[i, :fc]                            # [fc, 80]
+            mean = seg.mean(dim=0)                       # [80]
+            var = seg.var(dim=0, unbiased=True)           # [80]
+            mel[i, :fc] = (seg - mean) / torch.sqrt(var + 1e-7)
+
+        # Pad to multiple of stride
+        remainder = max_valid % self.stride
+        if remainder != 0:
+            pad_n = self.stride - remainder
+            mel = torch.nn.functional.pad(mel, (0, 0, 0, pad_n))
+            attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_n))
+            max_valid += pad_n
+
+        # Stride reshape: [B, T, 80] → [B, T//s, 80*s]
+        mel = mel.reshape(batch_size, max_valid // self.stride,
+                          self.num_mel_bins * self.stride)
+
+        # Attention mask stride (keep index % stride == 1)
+        indices = torch.arange(max_valid, device=device)
+        attention_mask = attention_mask[:, indices % self.stride == 1]
+
+        return {"input_features": mel, "attention_mask": attention_mask}
+
 
 @dataclass
 class DataPreprocessorReqData:
@@ -120,9 +223,16 @@ class DataPreprocessor(Process):
         self.gpt.eval() # 确保进入eval模式
         logger.info(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] gpt initializing...')
 
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
+        hf_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
             os.path.join(self.model_dir, "w2v-bert-2.0"),
         )
+        self.gpu_feature_extractor = GPUFeatureExtractor(
+            mel_filters_np=hf_extractor.mel_filters,
+            window_np=hf_extractor.window,
+        ).to(self.device)
+        self.gpu_feature_extractor.eval()
+        del hf_extractor
+        logger.info(f'[worker:{self.worker_id}] [gpu:{self.gpu_id}] gpu_feature_extractor initializing...')
 
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
             os.path.join(self.model_dir, cfg.w2v_stat),
@@ -205,17 +315,14 @@ class DataPreprocessor(Process):
         audio_tensors = []
         emo_audio_tensors = []
         for d in input_data_list:
-            # wav = torch.from_numpy(d.audio)
-            wav = d.audio
+            wav = d.audio.to(self.device, non_blocking=True)
             if d.orig_sr != TARGET_SR:
-                wav = wav.to(self.device, non_blocking=True)
                 resampler = self.get_resampler(d.orig_sr)
                 wav = resampler(wav)
             audio_tensors.append(wav)
-            
-            emo_wav = d.emo_audio
+
+            emo_wav = d.emo_audio.to(self.device, non_blocking=True)
             if d.orig_sr != TARGET_SR:
-                emo_wav = emo_wav.to(self.device, non_blocking=True)
                 resampler = self.get_resampler(d.orig_sr)
                 emo_wav = resampler(emo_wav)
             emo_audio_tensors.append(emo_wav)
@@ -259,10 +366,11 @@ class DataPreprocessor(Process):
         text_ids = torch.tensor(text_ids, dtype=torch.int16)  # [text_len]
         text_len = len(text_ids)
 
-        # Extract Features
-        inputs = self.extract_features(audio, sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+        # Extract Features (GPU)
+        audio_gpu = audio.to(self.device) if not audio.is_cuda else audio
+        inputs = self.gpu_feature_extractor([audio_gpu])
+        input_features = inputs["input_features"]
+        attention_mask = inputs["attention_mask"]
         
         # Get Speaker Condition Embedding
         spk_cond_emb = self.get_emb(input_features, attention_mask)
@@ -279,10 +387,11 @@ class DataPreprocessor(Process):
         
         conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device).squeeze(0)  # [32, 1280]
         
-        # emo_vec: 全部使用情感音频
-        inputs_emo = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-        input_features_emo = inputs_emo["input_features"].to(self.device)
-        attention_mask_emo = inputs_emo["attention_mask"].to(self.device)
+        # emo_vec: 全部使用情感音频 (GPU)
+        emo_audio_gpu = emo_audio.to(self.device) if not emo_audio.is_cuda else emo_audio
+        inputs_emo = self.gpu_feature_extractor([emo_audio_gpu])
+        input_features_emo = inputs_emo["input_features"]
+        attention_mask_emo = inputs_emo["attention_mask"]
         spk_cond_emb_emo = self.get_emb(input_features_emo, attention_mask_emo)
         cond_lengths_emo = attention_mask_emo.sum(dim=1).long()
         cond_lengths_device_emo = cond_lengths_emo.to(spk_cond_emb_emo.device)
@@ -325,10 +434,10 @@ class DataPreprocessor(Process):
             text_ids_list.append(text_ids)
             text_lens.append(text_len)
 
-        # Extract Features
-        inputs = self.extract_features([a.cpu().numpy() for a in audios], sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+        # Extract Features (GPU)
+        inputs = self.gpu_feature_extractor(audios)
+        input_features = inputs["input_features"]
+        attention_mask = inputs["attention_mask"]
         
         # Get Speaker Condition Embedding
         spk_cond_emb = self.get_emb(input_features, attention_mask)
@@ -350,10 +459,10 @@ class DataPreprocessor(Process):
         
         conditioning = self.gpt.get_conditioning(feat_t, cond_lengths_device)  # [b, 32, 1280]
         
-        # Extract Features for emo audios
-        inputs_emo = self.extract_features([a.cpu().numpy() for a in emo_audios], sampling_rate=16000, return_tensors="pt")
-        input_features_emo = inputs_emo["input_features"].to(self.device)
-        attention_mask_emo = inputs_emo["attention_mask"].to(self.device)
+        # Extract Features for emo audios (GPU)
+        inputs_emo = self.gpu_feature_extractor(emo_audios)
+        input_features_emo = inputs_emo["input_features"]
+        attention_mask_emo = inputs_emo["attention_mask"]
         
         spk_cond_emb_emo = self.get_emb(input_features_emo, attention_mask_emo)
         cond_lengths_emo = attention_mask_emo.sum(dim=1).long()
