@@ -68,6 +68,16 @@ SOURCE_CER_TYPES: Dict[str, str] = {
     "Japanese-Eroge-Voice": "pron_CER",
 }
 
+# 这些 source 在统计时若某个 speaker_id 仅出现 1 条样本，则丢弃该样本
+# （与 convert_to_arrow_multi.py 中 REQUIRE_MULTI_SAMPLE_SOURCES 对齐；
+#   注意此处采用 per-source 全局粒度，convert 脚本是 per-shard 粒度，统计值
+#   作为 convert 结果的上界参考。）
+REQUIRE_MULTI_SAMPLE_SOURCES: List[str] = [
+    "Emilia_JA",
+    "Emilia-YODAS_JA",
+    "Gacha_games_jp",
+]
+
 # 并行相关配置
 MAX_WORKERS = 8  # os.cpu_count()  # 使用所有 CPU 核心，也可以手动指定如 16
 
@@ -111,8 +121,12 @@ def process_single_file(args):
         "cer_skip": 0,
         "silence_skip": 0,
         "diarization_skip": 0,
+        # 仅 REQUIRE_MULTI_SAMPLE_SOURCES 中的 source 才填充：
+        # speaker_id -> [count, duration_sum]
+        "speaker_stats": defaultdict(lambda: [0, 0.0]),
         "error": None
     }
+    track_speaker = source_name in REQUIRE_MULTI_SAMPLE_SOURCES
 
     try:
         # 1. 获取 Parquet 路径
@@ -125,7 +139,8 @@ def process_single_file(args):
         try:
             pf = pq.ParquetFile(parquet_path)
             meta_len = pf.metadata.num_rows
-            batch_iterator = pf.iter_batches(batch_size=256, columns=["whisper_large_v3", "speaker", "speaker_diarization"])
+            batch_columns = ["whisper_large_v3", "speaker", "speaker_diarization"]
+            batch_iterator = pf.iter_batches(batch_size=256, columns=batch_columns)
         except Exception as e:
             stats["error"] = f"Parquet Error: {e}"
             return stats
@@ -175,7 +190,8 @@ def process_single_file(args):
             # 从 batch 字典获取对应行，处理可能缺少的列
             whisper_info = current_batch.get("whisper_large_v3", [{}])[local_idx] if "whisper_large_v3" in current_batch else {}
             speaker_diar = current_batch.get("speaker_diarization", [[]])[local_idx] if "speaker_diarization" in current_batch else []
-            
+            raw_speaker = current_batch.get("speaker", [None])[local_idx] if "speaker" in current_batch else None
+
             data_idx += 1
             
             # --- 过滤逻辑开始 ---
@@ -215,12 +231,23 @@ def process_single_file(args):
                 continue
 
             # --- 统计有效数据 ---
-            stats["valid_count"] += 1
-            stats["valid_duration"] += processed_data.duration
+            if track_speaker:
+                if raw_speaker is not None:
+                    spk_id = str(raw_speaker)
+                else:
+                    spk_id = f"{source_name}_idx_{parquet_idx}"
+                entry = stats["speaker_stats"][spk_id]
+                entry[0] += 1
+                entry[1] += processed_data.duration
+            else:
+                stats["valid_count"] += 1
+                stats["valid_duration"] += processed_data.duration
 
     except Exception as e:
         stats["error"] = f"Process Error: {traceback.format_exc()}"
-    
+
+    # defaultdict 在跨进程序列化时无 lambda factory，转回普通 dict
+    stats["speaker_stats"] = dict(stats["speaker_stats"])
     return stats
 
 def main():
@@ -261,20 +288,41 @@ def main():
     # 3. 聚合结果
     final_num_dict = defaultdict(int)
     final_duration_dict = defaultdict(float)
-    
+    # 仅 REQUIRE_MULTI_SAMPLE_SOURCES 用：source -> speaker_id -> [count, duration]
+    speaker_aggr: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))
+    # 记录每个 source 由于 singleton 被丢弃的样本数与时长
+    singleton_drop_count: Dict[str, int] = defaultdict(int)
+    singleton_drop_duration: Dict[str, float] = defaultdict(float)
+
     # 错误日志聚合
     error_logs = []
 
     print("\n正在聚合统计结果...")
     for res in results:
         src = res["source_name"]
-        
+
         # 记录错误
         if res["error"]:
             error_logs.append(res["error"])
-            
+
         final_num_dict[src] += res["valid_count"]
         final_duration_dict[src] += res["valid_duration"]
+
+        # 汇总 per-speaker 统计
+        for spk_id, (cnt, dur) in res.get("speaker_stats", {}).items():
+            entry = speaker_aggr[src][spk_id]
+            entry[0] += cnt
+            entry[1] += dur
+
+    # 对 REQUIRE_MULTI_SAMPLE_SOURCES：丢弃 speaker 总样本数 < 2 的样本
+    for src in REQUIRE_MULTI_SAMPLE_SOURCES:
+        for spk_id, (cnt, dur) in speaker_aggr.get(src, {}).items():
+            if cnt < 2:
+                singleton_drop_count[src] += cnt
+                singleton_drop_duration[src] += dur
+                continue
+            final_num_dict[src] += cnt
+            final_duration_dict[src] += dur
 
     # 4. 输出报告
     print("\n" + "="*30)
@@ -287,21 +335,25 @@ def main():
             print(err)
         print("-" * 20)
 
-    print(f"{'Source Name':<30} | {'Count':<10} | {'Hours':<10}")
-    print("-" * 56)
-    
+    print(f"{'Source Name':<30} | {'Count':<10} | {'Hours':<10} | {'DropSingleton':<14}")
+    print("-" * 76)
+
     total_duration_all = 0
     total_count_all = 0
-    
+
     for source_name in SOURCE_NAMES:
         count = final_num_dict[source_name]
         dur_hours = final_duration_dict[source_name] / 3600
         total_count_all += count
         total_duration_all += final_duration_dict[source_name]
-        
-        print(f"{source_name:<30} | {count:<10} | {dur_hours:.2f} h")
-    
-    print("-" * 56)
+
+        drop_str = ""
+        if source_name in REQUIRE_MULTI_SAMPLE_SOURCES:
+            drop_str = f"{singleton_drop_count[source_name]} ({singleton_drop_duration[source_name]/3600:.2f}h)"
+
+        print(f"{source_name:<30} | {count:<10} | {dur_hours:<10.2f} | {drop_str:<14}")
+
+    print("-" * 76)
     print(f"{'TOTAL':<30} | {total_count_all:<10} | {(total_duration_all / 3600):.2f} h")
 
 if __name__ == "__main__":

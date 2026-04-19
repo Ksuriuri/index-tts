@@ -18,15 +18,20 @@ from torch.multiprocessing import Process, Queue, Value
 import soundfile as sf
 
 
-# DATASET_NAME = "Emilia_JA"
-# DATASET_NAME = "Emilia-YODAS_JA"
-DATASET_NAME = "Gacha_games_jp"
-# DATASET_NAME = "Galgame-VisualNovel-Reupload"
-# DATASET_NAME = "Japanese-Eroge-Voice"
+DATASET_NAMES = [
+    # "Emilia_JA",
+    # "Emilia-YODAS_JA",
+    # "Gacha_games_jp",
+    # "Galgame-VisualNovel-Reupload",
+    # "Japanese-Eroge-Voice",
 
-DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
-OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/emo_synthesis_data/{DATASET_NAME}"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # "google-chilean-spanish",
+    "voxpopuli",
+    "MLS_Spanish",
+]
+
+DATA_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+OUTPUT_ROOT = "/mnt/data_3t_1/datasets/preprocess/emo_synthesis_data"
 
 # --- 加载 TTS 文本 ---
 TTS_TEXTS = []
@@ -40,13 +45,17 @@ MIN_AUDIO_DURATION = 3  # 6
 MAX_AUDIO_DURATION = 30  # 36
 
 CER_THRESHOLD = 0.30  # 0.10
-# CER_TYPE = "cer"
-CER_TYPE = "pron_CER"
+CER_TYPE = "cer"
+# CER_TYPE = "pron_CER"
 
-# --- 新的配置参数 ---
-NUM_TTS_PORTS = 8           # 端口数量 (0-7)
-MAX_REQ_PER_PORT = 16       # 每个端口最大并发
-TOTAL_CONCURRENCY = NUM_TTS_PORTS * MAX_REQ_PER_PORT # 总并发 256
+# --- 并发配置 ---
+NUM_TTS_PORTS = 8           # TTS 端口数量 (0-7)
+MAX_REQ_PER_PORT = 2        # 每个 TTS 端口最大并发
+TOTAL_CONCURRENCY = NUM_TTS_PORTS * MAX_REQ_PER_PORT
+MAX_VC_CONCURRENCY = 16     # VC 服务全局最大并发
+TTS_TIMEOUT_SECONDS = 30
+VC_TIMEOUT_SECONDS = 20
+MAX_TIMEOUT_RETRIES = 3
 
 try:
     mp.set_start_method('spawn', force=True)
@@ -76,68 +85,107 @@ async def tts_gen_async(session, text, audio_bytes, port_id):
         "surprise": 0.0, "calm": 0.0
     }
     
-    # 使用 aiohttp 的 FormData
-    data = aiohttp.FormData()
-    data.add_field('synthesis_text', text)
-    data.add_field('emo', json.dumps(emo_vec, ensure_ascii=False))
-    # add_field 处理文件上传
-    data.add_field('wav', io.BytesIO(audio_bytes), filename=file_name, content_type=mime_type)
+    def build_data():
+        data = aiohttp.FormData()
+        data.add_field('synthesis_text', text)
+        data.add_field('emo', json.dumps(emo_vec, ensure_ascii=False))
+        data.add_field('wav', io.BytesIO(audio_bytes), filename=file_name, content_type=mime_type)
+        return data
 
     try:
-        # 异步发送 POST 请求
-        async with session.post(target_url, data=data, timeout=60) as response:
-            if response.status == 200:
-                return await response.read()
-            else:
-                text_response = await response.text()
-                raise Exception(f"服务异常 ({selected_port}): {response.status} - {text_response}")
+        return await post_with_timeout_retry(
+            session=session,
+            url=target_url,
+            build_data=build_data,
+            timeout_seconds=TTS_TIMEOUT_SECONDS,
+            request_name=f"TTS({selected_port})",
+        )
             
     except Exception as e:
         raise Exception(f"连接端口 {selected_port} 失败: {e}")
+
+async def post_with_timeout_retry(session, url, build_data, timeout_seconds, request_name):
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+
+    for attempt in range(1, MAX_TIMEOUT_RETRIES + 1):
+        try:
+            async with session.post(url, data=build_data(), timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.read()
+
+                text_response = await response.text()
+                raise Exception(f"{request_name} 服务异常: {response.status} - {text_response}")
+        except asyncio.TimeoutError as e:
+            if attempt >= MAX_TIMEOUT_RETRIES:
+                raise Exception(
+                    f"{request_name} 超时，已重试 {MAX_TIMEOUT_RETRIES} 次，每次超时 {timeout_seconds} 秒"
+                ) from e
+            logger.warning(
+                f"{request_name} 第 {attempt}/{MAX_TIMEOUT_RETRIES} 次请求超时，准备重试"
+            )
 
 # 异步 VC 请求函数
 async def vc_convert_async(session, source_audio_bytes, target_audio_bytes, host="http://127.0.0.1:11452"):
     url = f"{host}/convert"
     
-    data = aiohttp.FormData()
-    data.add_field('source', io.BytesIO(source_audio_bytes), filename='source.wav', content_type='audio/wav')
-    data.add_field('target', io.BytesIO(target_audio_bytes), filename='target.wav', content_type='audio/wav')
-    
-    data.add_field('diffusion_steps', '30')
-    data.add_field('length_adjust', '1.0')
-    data.add_field('intelligibility_cfg_rate', '0.7')
-    data.add_field('similarity_cfg_rate', '0.7')
-    data.add_field('top_p', '0.9')
-    data.add_field('temperature', '1.0')
-    data.add_field('repetition_penalty', '1.0')
-    data.add_field('convert_style', 'False')
-    data.add_field('anonymization_only', 'False')
+    def build_data():
+        data = aiohttp.FormData()
+        data.add_field('source', io.BytesIO(source_audio_bytes), filename='source.wav', content_type='audio/wav')
+        data.add_field('target', io.BytesIO(target_audio_bytes), filename='target.wav', content_type='audio/wav')
+        
+        data.add_field('diffusion_steps', '30')
+        data.add_field('length_adjust', '1.0')
+        data.add_field('intelligibility_cfg_rate', '0.7')
+        data.add_field('similarity_cfg_rate', '0.7')
+        data.add_field('top_p', '0.9')
+        data.add_field('temperature', '1.0')
+        data.add_field('repetition_penalty', '1.0')
+        data.add_field('convert_style', 'False')
+        data.add_field('anonymization_only', 'False')
+        return data
 
     try:
-        async with session.post(url, data=data, timeout=120) as response:
-            if response.status == 200:
-                return await response.read()
-            else:
-                text_response = await response.text()
-                raise Exception(f"VC服务异常: {response.status} - {text_response}")
+        return await post_with_timeout_retry(
+            session=session,
+            url=url,
+            build_data=build_data,
+            timeout_seconds=VC_TIMEOUT_SECONDS,
+            request_name="VC",
+        )
     except Exception as e:
         raise Exception(f"连接VC服务失败: {e}")
 
 class TTSWorker(Process):
-    def __init__(self, file_queue: Queue, worker_id: int, progress_counter):
+    def __init__(self, file_queue: Queue, worker_id: int, progress_counter, dataset_dir: str, output_dir: str):
         super().__init__(daemon=True)
         self.file_queue = file_queue
         self.worker_id = worker_id
         self.progress_counter = progress_counter
+        self.dataset_dir = dataset_dir
+        self.output_dir = output_dir
 
     def run(self):
         # 启动异步事件循环
         asyncio.run(self._run_async())
 
-    async def _process_single_row(self, session, port_queue, current_port_id, idx, row_data, df, pbar):
+    async def _process_single_row(
+        self,
+        session,
+        port_queue,
+        vc_semaphore,
+        current_port_id,
+        idx,
+        row_data,
+        target_candidate_indices,
+        target_candidate_positions,
+        target_audio_map,
+        df,
+        pbar,
+    ):
         """
         处理单行数据的异步任务
         """
+        port_released = False
         try:
             audio_bytes = row_data['audio']
             
@@ -149,8 +197,6 @@ class TTSWorker(Process):
 
             # 2. 音频时长检查
             try:
-                # 注意：在大并发下，这里的 CPU 同步操作可能会轻微阻塞 EventLoop
-                # 如果发现性能瓶颈，可以考虑 loop.run_in_executor
                 array, sampling_rate = sf.read(io.BytesIO(audio_bytes), dtype='float32')
                 duration = array.shape[0] / sampling_rate
                 
@@ -166,20 +212,34 @@ class TTSWorker(Process):
             # 3. 准备文本和请求
             syn_text = random.choice(TTS_TEXTS)
             
-            # 4. 发送请求，使用分配到的 current_port_id
-            tts_audio = await tts_gen_async(session, syn_text, audio_bytes, current_port_id)
+            # 4. 发送 TTS 请求。TTS 返回后立即释放端口槽位，避免被后续 VC 阶段占住。
+            try:
+                tts_audio = await tts_gen_async(session, syn_text, audio_bytes, current_port_id)
+            finally:
+                port_queue.put_nowait(current_port_id)
+                port_released = True
             
             # 5. 随机选择目标音频
-            available_indices = [i for i in df.index if i != idx and df.at[i, 'audio']]
-            if not available_indices:
+            candidate_count = len(target_candidate_indices)
+            idx_position = target_candidate_positions.get(idx)
+            if candidate_count == 0 or (candidate_count == 1 and idx_position is not None):
                 df.at[idx, 'audio'] = b""
                 df.at[idx, 'text'] = ""
                 return
-            target_idx = random.choice(available_indices)
-            target_audio_bytes = df.at[target_idx, 'audio']
+
+            if idx_position is None:
+                target_idx = random.choice(target_candidate_indices)
+            else:
+                random_pos = random.randrange(candidate_count - 1)
+                if random_pos >= idx_position:
+                    random_pos += 1
+                target_idx = target_candidate_indices[random_pos]
+
+            target_audio_bytes = target_audio_map[target_idx]
             
-            # 6. 调用 VC 接口
-            new_audio = await vc_convert_async(session, tts_audio, target_audio_bytes)
+            # 6. 调用 VC 接口，使用独立的全局限流
+            async with vc_semaphore:
+                new_audio = await vc_convert_async(session, tts_audio, target_audio_bytes)
             
             # 7. 更新结果
             df.at[idx, 'audio'] = new_audio
@@ -190,8 +250,8 @@ class TTSWorker(Process):
             df.at[idx, 'audio'] = b""
             df.at[idx, 'text'] = ""
         finally:
-            # 关键修改：任务结束，将端口 ID 放回队列，供下一个任务使用
-            port_queue.put_nowait(current_port_id)
+            if not port_released:
+                port_queue.put_nowait(current_port_id)
             pbar.update(1)
 
     async def _run_async(self):
@@ -203,10 +263,13 @@ class TTSWorker(Process):
             for _ in range(MAX_REQ_PER_PORT):
                 port_queue.put_nowait(p)
 
-        logger.info(f"Worker started. Total concurrency slots: {port_queue.qsize()}")
+        vc_semaphore = asyncio.Semaphore(MAX_VC_CONCURRENCY)
+        logger.info(
+            f"Worker started. TTS slots: {port_queue.qsize()}, VC concurrency: {MAX_VC_CONCURRENCY}"
+        )
 
-        # 创建异步 session，连接池大小要大于总并发数
-        connector = aiohttp.TCPConnector(limit=TOTAL_CONCURRENCY + 20) 
+        # 连接池大小覆盖 TTS 和 VC 的并发请求
+        connector = aiohttp.TCPConnector(limit=TOTAL_CONCURRENCY + MAX_VC_CONCURRENCY + 20)
         async with aiohttp.ClientSession(connector=connector) as session:
             
             while True:
@@ -218,7 +281,7 @@ class TTSWorker(Process):
                     
                     if parquet_path is None: break
 
-                    output_path = os.path.join(OUTPUT_DIR, os.path.relpath(parquet_path, DATASET_DIR))
+                    output_path = os.path.join(self.output_dir, os.path.relpath(parquet_path, self.dataset_dir))
                     
                     if os.path.exists(output_path):
                         with self.progress_counter.get_lock():
@@ -240,8 +303,11 @@ class TTSWorker(Process):
 
                     # --- 核心异步并发逻辑 ---
                     tasks = []
+                    processable_indices = []
+                    target_candidate_indices = []
+                    target_audio_map = {}
 
-                    # 遍历 DataFrame 提交任务
+                    # 先完成轻量筛选，并预构建目标音频池，避免每个任务都扫描整张 df
                     for idx in df.index:
                         whisper_info = df.at[idx, 'whisper_large_v3']
                         if whisper_info.get(CER_TYPE) > CER_THRESHOLD:
@@ -255,16 +321,28 @@ class TTSWorker(Process):
                             df.at[idx, 'text'] = ""
                             continue
 
-                        # 1. 从队列获取一个可用的端口 ID
-                        # 如果所有 256 个 slot 都在忙，这里会阻塞，实现了并发控制
+                        processable_indices.append(idx)
+                        if df.at[idx, 'audio']:
+                            target_candidate_indices.append(idx)
+                            target_audio_map[idx] = df.at[idx, 'audio']
+
+                    target_candidate_positions = {
+                        candidate_idx: pos
+                        for pos, candidate_idx in enumerate(target_candidate_indices)
+                    }
+
+                    # 遍历可处理行提交任务
+                    for idx in processable_indices:
+                        # 1. 从队列获取一个可用的 TTS 端口槽位
                         current_port_id = await port_queue.get()
                         
                         # 2. 创建任务
                         row_data = {'audio': df.at[idx, 'audio']}
                         task = asyncio.create_task(
                             self._process_single_row(
-                                session, port_queue, current_port_id, 
-                                idx, row_data, df, file_pbar
+                                session, port_queue, vc_semaphore, current_port_id,
+                                idx, row_data, target_candidate_indices,
+                                target_candidate_positions, target_audio_map, df, file_pbar
                             )
                         )
                         tasks.append(task)
@@ -288,44 +366,53 @@ class TTSWorker(Process):
         logger.info(f"[Worker-{self.worker_id}] Finished.")
 
 def main():
-    if not os.path.exists(DATASET_DIR):
-        logger.error(f"Input directory {DATASET_DIR} does not exist.")
-        return
+    for dataset_name in DATASET_NAMES:
+        dataset_dir = os.path.join(DATA_ROOT, dataset_name)
+        output_dir = os.path.join(OUTPUT_ROOT, dataset_name)
+        os.makedirs(output_dir, exist_ok=True)
 
-    all_parquet_files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.parquet")))
-    total_files = len(all_parquet_files)
-    logger.info(f"Found {total_files} parquet files.")
+        if not os.path.exists(dataset_dir):
+            logger.warning(f"Input directory {dataset_dir} does not exist, skipping.")
+            continue
 
-    file_queue = Queue()
-    for f in all_parquet_files:
-        file_queue.put(f)
+        all_parquet_files = sorted(glob.glob(os.path.join(dataset_dir, "*.parquet")))
+        total_files = len(all_parquet_files)
+        logger.info(f"===== Dataset: {dataset_name} | {total_files} parquet files =====")
 
-    processed_counter = Value('i', 0)
-    workers = []
-    
-    # --- 修改：只启动 1 个 Worker ---
-    logger.info(f"Starting single TTSWorker with {TOTAL_CONCURRENCY} concurrent requests across {NUM_TTS_PORTS} ports.")
-    
-    p = TTSWorker(file_queue, 0, processed_counter)
-    p.start()
-    workers.append(p)
+        if total_files == 0:
+            logger.warning(f"No parquet files found in {dataset_dir}, skipping.")
+            continue
 
-    # 全局进度条 (Position 0)
-    with tqdm(total=total_files, desc="TOTAL FILES", position=0, dynamic_ncols=True) as pbar:
-        last_val = 0
-        while any(p.is_alive() for p in workers):
-            curr_val = processed_counter.value
-            if curr_val > last_val:
-                pbar.update(curr_val - last_val)
-                last_val = curr_val
-            time.sleep(1)
-        pbar.update(processed_counter.value - last_val)
+        file_queue = Queue()
+        for f in all_parquet_files:
+            file_queue.put(f)
 
-    for p in workers:
-        p.join()
-        
-    print("\n")
-    logger.info("All processing done.")
+        processed_counter = Value('i', 0)
+        workers = []
+
+        logger.info(f"Starting single TTSWorker with {TOTAL_CONCURRENCY} concurrent requests across {NUM_TTS_PORTS} ports.")
+
+        p = TTSWorker(file_queue, 0, processed_counter, dataset_dir, output_dir)
+        p.start()
+        workers.append(p)
+
+        with tqdm(total=total_files, desc=f"[{dataset_name}] FILES", position=0, dynamic_ncols=True) as pbar:
+            last_val = 0
+            while any(p.is_alive() for p in workers):
+                curr_val = processed_counter.value
+                if curr_val > last_val:
+                    pbar.update(curr_val - last_val)
+                    last_val = curr_val
+                time.sleep(1)
+            pbar.update(processed_counter.value - last_val)
+
+        for p in workers:
+            p.join()
+
+        print("\n")
+        logger.info(f"Dataset {dataset_name} done.")
+
+    logger.info("All datasets processing done.")
 
 if __name__ == "__main__":
     main()

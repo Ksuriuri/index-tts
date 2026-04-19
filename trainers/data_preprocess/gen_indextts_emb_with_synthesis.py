@@ -48,12 +48,13 @@ OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
 BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_bpe.model")
 TARGET_SR = 16000
-CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
+CPU_WORKERS_NUM = 2  # 负责读取和解码的CPU进程数
 DEVICE_NUM = 8
 PROCESSORS_PER_DEVICE = 1
 MAX_GPU_TASK_QUEUE_SIZE = 16  # 限制队列大小防止内存爆炸
 MAX_AUDIO_DURATION = 36
-BATCH_SIZE = 12
+BATCH_SIZE = 8
+EMO_ORIGINAL_PROB = 0  # emo_vec使用原始音频的概率，0=全部用合成音频，0.5=各半
 
 
 TARGET_SR = 16000
@@ -344,10 +345,18 @@ class DataPreprocessor(Process):
         
         # Get Speaker Condition Embedding from synthesis audio
         spk_cond_emb_syn = self.get_emb(input_features_syn, attention_mask_syn)
-
-        # Quantize / Codec (使用合成音频)
         cond_lengths_syn = attention_mask_syn.sum(dim=1).long()
-        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb_syn)
+
+        # Extract Features for original audio (用于codes和emo_vec)
+        audio_gpu = audio.to(self.device) if not audio.is_cuda else audio
+        inputs_orig = self.gpu_feature_extractor([audio_gpu])
+        input_features_orig = inputs_orig["input_features"]
+        attention_mask_orig = inputs_orig["attention_mask"]
+        spk_cond_emb_orig = self.get_emb(input_features_orig, attention_mask_orig)
+        cond_lengths_orig = attention_mask_orig.sum(dim=1).long()
+
+        # Quantize / Codec (使用原始音频)
+        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb_orig)
         semantic_code = semantic_code.squeeze(0)
         code_len = semantic_code.shape[0]
 
@@ -357,20 +366,12 @@ class DataPreprocessor(Process):
         
         conditioning = self.gpt.get_conditioning(feat_t_syn, cond_lengths_device_syn).squeeze(0)  # [32, 1280]
         
-        # emo_vec: 50%概率使用原音频，50%概率使用合成音频
-        use_original_for_emo = random.random() < 0.5
+        # emo_vec: EMO_ORIGINAL_PROB概率使用原音频，其余使用合成音频
+        use_original_for_emo = EMO_ORIGINAL_PROB > 0 and random.random() < EMO_ORIGINAL_PROB
         if use_original_for_emo:
-            # 使用原始音频生成emo_vec (GPU)
-            audio_gpu = audio.to(self.device) if not audio.is_cuda else audio
-            inputs_orig = self.gpu_feature_extractor([audio_gpu])
-            input_features_orig = inputs_orig["input_features"]
-            attention_mask_orig = inputs_orig["attention_mask"]
-            spk_cond_emb_orig = self.get_emb(input_features_orig, attention_mask_orig)
-            cond_lengths_orig = attention_mask_orig.sum(dim=1).long()
             cond_lengths_device_orig = cond_lengths_orig.to(spk_cond_emb_orig.device)
             emo_vec = self.gpt.get_emovec(spk_cond_emb_orig, cond_lengths_device_orig).squeeze(0)  # [1280]
         else:
-            # 使用合成音频生成emo_vec
             emo_vec = self.gpt.get_emovec(spk_cond_emb_syn, cond_lengths_device_syn).squeeze(0)  # [1280]
 
         processed_data = ProcessedData(
@@ -417,15 +418,22 @@ class DataPreprocessor(Process):
         
         # Get Speaker Condition Embedding from synthesis audios
         spk_cond_emb_syn = self.get_emb(input_features_syn, attention_mask_syn)
-
-        # Quantize / Codec (使用合成音频)
         cond_lengths_syn = attention_mask_syn.sum(dim=1).long()
-        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb_syn)  # [b, code_len]
+
+        # Extract Features for original audios (用于codes和emo_vec)
+        inputs_orig = self.gpu_feature_extractor(audios)
+        input_features_orig = inputs_orig["input_features"]
+        attention_mask_orig = inputs_orig["attention_mask"]
+        spk_cond_emb_orig = self.get_emb(input_features_orig, attention_mask_orig)
+        cond_lengths_orig = attention_mask_orig.sum(dim=1).long()
+
+        # Quantize / Codec (使用原始音频)
+        semantic_code, _ = self.semantic_codec.quantize(spk_cond_emb_orig)  # [b, code_len]
 
         semantic_codes = []
         code_lens = []
         for b in range(batch_size):
-            semantic_code_ = semantic_code[b, :cond_lengths_syn[b]]
+            semantic_code_ = semantic_code[b, :cond_lengths_orig[b]]
             semantic_codes.append(semantic_code_)
             code_lens.append(semantic_code_.shape[0])
 
@@ -435,32 +443,22 @@ class DataPreprocessor(Process):
         
         conditioning = self.gpt.get_conditioning(feat_t_syn, cond_lengths_device_syn)  # [b, 32, 1280]
         
-        # Extract Features for original audios (GPU, 用于emo_vec，50%概率使用)
-        inputs_orig = self.gpu_feature_extractor(audios)
-        input_features_orig = inputs_orig["input_features"]
-        attention_mask_orig = inputs_orig["attention_mask"]
-        
-        # Get Speaker Condition Embedding from original audios
-        spk_cond_emb_orig = self.get_emb(input_features_orig, attention_mask_orig)
-        cond_lengths_orig = attention_mask_orig.sum(dim=1).long()
-        cond_lengths_device_orig = cond_lengths_orig.to(spk_cond_emb_orig.device)
-        
-        # Get emo_vec from both original and synthesis audios
-        emo_vec_orig = self.gpt.get_emovec(spk_cond_emb_orig, cond_lengths_device_orig)  # [b, 1280]
+        # emo_vec: EMO_ORIGINAL_PROB概率使用原音频，其余使用合成音频
         emo_vec_syn = self.gpt.get_emovec(spk_cond_emb_syn, cond_lengths_device_syn)  # [b, 1280]
         
-        # emo_vec: 50%概率使用原音频，50%概率使用合成音频
-        # 为每个样本随机决定使用哪个音频
-        emo_vec_batch = []
-        for b in range(batch_size):
-            use_original_for_emo = random.random() < 0.5
-            if use_original_for_emo:
-                emo_vec_batch.append(emo_vec_orig[b])
-            else:
-                emo_vec_batch.append(emo_vec_syn[b])
-        
-        # 将emo_vec_batch转换为tensor
-        emo_vec_batch = torch.stack(emo_vec_batch, dim=0)  # [b, 1280]
+        if EMO_ORIGINAL_PROB > 0:
+            cond_lengths_device_orig = cond_lengths_orig.to(spk_cond_emb_orig.device)
+            emo_vec_orig = self.gpt.get_emovec(spk_cond_emb_orig, cond_lengths_device_orig)  # [b, 1280]
+            
+            emo_vec_batch = []
+            for b in range(batch_size):
+                if random.random() < EMO_ORIGINAL_PROB:
+                    emo_vec_batch.append(emo_vec_orig[b])
+                else:
+                    emo_vec_batch.append(emo_vec_syn[b])
+            emo_vec_batch = torch.stack(emo_vec_batch, dim=0)  # [b, 1280]
+        else:
+            emo_vec_batch = emo_vec_syn
 
         conditioning = conditioning.to(device="cpu", dtype=torch.float16)
         emo_vec_batch = emo_vec_batch.to(device="cpu", dtype=torch.float16)

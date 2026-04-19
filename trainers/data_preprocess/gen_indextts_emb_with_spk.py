@@ -39,19 +39,19 @@ from trainers.utils import ProcessedData
 
 random.seed(42)
 
+# DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
+# DATASET_ROOTS = [
+#     f"{DATASET_ROOT}/Emilia_JA",
+#     f"{DATASET_ROOT}/Emilia-YODAS_JA",
+#     f"{DATASET_ROOT}/Gacha_games_jp",
+# ]
+
 DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATASET_ROOTS = [
-    f"{DATASET_ROOT}/Emilia_JA",
-    f"{DATASET_ROOT}/Emilia-YODAS_JA",
-    f"{DATASET_ROOT}/Gacha_games_jp",
+    f"{DATASET_ROOT}/google-chilean-spanish",
+    f"{DATASET_ROOT}/MLS_Spanish",
+    f"{DATASET_ROOT}/voxpopuli",
 ]
-
-# DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess/Spanish"
-# DATASET_ROOTS = [
-#     f"{DATASET_ROOT}/google-chilean-spanish",
-#     f"{DATASET_ROOT}/MLS_Spanish",
-#     f"{DATASET_ROOT}/voxpopuli",
-# ]
 
 EMO_SYNTHESIS_ROOT = "/mnt/data_3t_1/datasets/preprocess/emo_synthesis_data"
 
