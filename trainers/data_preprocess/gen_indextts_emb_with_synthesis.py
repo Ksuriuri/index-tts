@@ -43,10 +43,11 @@ SYNTHESIS_ROOT = "/mnt/data_3t_1/datasets/preprocess/synthesis_data"
 DATASET_ROOTS = [
     f"{DATASET_ROOT}/Galgame-VisualNovel-Reupload",
     f"{DATASET_ROOT}/Japanese-Eroge-Voice",
+    f"{DATASET_ROOT}/maa",
 ]
-OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
+OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2/jp_es"
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
-BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_bpe.model")
+BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_es_bpe.model")
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 2  # 负责读取和解码的CPU进程数
 DEVICE_NUM = 8
@@ -148,7 +149,8 @@ class DataPreprocessorReqData:
     text: str
     audio: torch.Tensor  # 原始音频
     synthesis_audio: torch.Tensor  # 合成音频
-    orig_sr: int
+    audio_sr: int
+    synthesis_sr: int
     file_rel_path: str
     original_index: int
     speaker_id: str = None
@@ -287,14 +289,14 @@ class DataPreprocessor(Process):
         synthesis_audio_tensors = []
         for d in input_data_list:
             wav = d.audio.to(self.device, non_blocking=True)
-            if d.orig_sr != TARGET_SR:
-                resampler = self.get_resampler(d.orig_sr)
+            if d.audio_sr != TARGET_SR:
+                resampler = self.get_resampler(d.audio_sr)
                 wav = resampler(wav)
             audio_tensors.append(wav)
 
             syn_wav = d.synthesis_audio.to(self.device, non_blocking=True)
-            if d.orig_sr != TARGET_SR:
-                resampler = self.get_resampler(d.orig_sr)
+            if d.synthesis_sr != TARGET_SR:
+                resampler = self.get_resampler(d.synthesis_sr)
                 syn_wav = resampler(syn_wav)
             synthesis_audio_tensors.append(syn_wav)
         
@@ -604,7 +606,8 @@ class AudioLoaderWorker(Process):
                                 text=text,
                                 audio=audio_tensor,  # float32
                                 synthesis_audio=synthesis_audio_tensor,  # float32
-                                orig_sr=sampling_rate,
+                                audio_sr=sampling_rate,
+                                synthesis_sr=syn_sampling_rate,
                                 file_rel_path=rel_path,
                                 original_index=current_file_index
                             )

@@ -25,7 +25,7 @@ DATASET_NAMES = [
     # "Galgame-VisualNovel-Reupload",
     # "Japanese-Eroge-Voice",
 
-    # "google-chilean-spanish",
+    "google-chilean-spanish",
     "voxpopuli",
     "MLS_Spanish",
 ]

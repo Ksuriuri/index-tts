@@ -35,7 +35,7 @@ except RuntimeError:
 
 # --- 配置 ---
 DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Spanish/voxpopuli"
-OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/Spanish/voxpopuli"
+OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/voxpopuli"
 CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json") 
 
 WHISPER_MODEL_SIZE = "large-v3"

@@ -1,3 +1,14 @@
+# 处理 khursani8/maa (Spanish 子集) 数据
+# 数据下载位置: /mnt/data_3t_1/datasets/raw_data/Spanish/maa/data/spanish/*.parquet
+# 数据 schema:
+#   audio: struct<bytes: binary, path: string>   # WAV bytes, 16kHz mono
+#   transcript: string
+#   phoneme_sequence: string
+#   words: list<struct<word, start, end>>
+#   phonemes: list<struct<phoneme, start, end>>
+#   source: string  (e.g. cml_tts_dataset, librivox, tedx_spanish ...)
+# 该数据集没有 speaker_id 字段，speaker 设为 None；保留 MFA 对齐信息到输出。
+
 # export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/tanhe/miniconda3/envs/index-tts/lib/python3.10/site-packages/nvidia/cudnn/lib
 
 import os
@@ -6,7 +17,7 @@ import glob
 import queue
 import time
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import traceback
 from typing import List, Dict, Any, Set, Optional
 
@@ -34,18 +45,21 @@ except RuntimeError:
     pass
 
 # --- 配置 ---
-DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Spanish/google-chilean-spanish"
-OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/google-chilean-spanish"
-CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json") 
+DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Spanish/maa"
+OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/maa"
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json")
+
+# 仅处理 spanish 子集
+LANG_SUBDIR = "data/spanish"
 
 WHISPER_MODEL_SIZE = "large-v3"
-COMPUTE_TYPE = "float16" 
+COMPUTE_TYPE = "float16"
 DEVICE_NUM = 8
 PROCESSORS_PER_DEVICE = 1
 CPU_WORKERS_NUM = 1
 BATCH_SIZE = 16
 SAVE_INTERVAL = 20000
-MAX_AUDIO_DURATION = -1  # 36
+MAX_AUDIO_DURATION = -1  # 秒，-1 表示不限制
 
 
 def normalize_text_for_cer(text: str) -> str:
@@ -58,11 +72,16 @@ def normalize_text_for_cer(text: str) -> str:
 
 @dataclass
 class ASRTask:
-    audio_raw: np.ndarray  # float16，输出时再转为 bytes
+    audio_bytes: bytes              # 原始 WAV bytes (16kHz mono)，直接透传不再转码
+    audio_raw: np.ndarray           # float16，仅用于送入 whisper
     sample_rate: int
     text_gt: str
     source_file: str
-    speaker_id: Optional[str] = None  
+    source_tag: Optional[str] = None        # 来自数据集的 source 字段 (cml_tts_dataset / librivox / ...)
+    phoneme_sequence: Optional[str] = None
+    words: Optional[List[Dict[str, Any]]] = None
+    phonemes: Optional[List[Dict[str, Any]]] = None
+
 
 class AudioLoaderWorker(Process):
     def __init__(self, file_queue: Queue, gpu_task_queue: Queue, worker_id: int, checkpoint: Dict[str, int], file_pbar_counter):
@@ -82,8 +101,9 @@ class AudioLoaderWorker(Process):
                 parquet_path = self.file_queue.get(timeout=10)
             except queue.Empty:
                 break
-            
-            if parquet_path is None: break
+
+            if parquet_path is None:
+                break
 
             try:
                 skip_count = self.checkpoint.get(parquet_path, 0)
@@ -96,60 +116,70 @@ class AudioLoaderWorker(Process):
                 no_text_count = 0
                 no_audio_count = 0
                 total_count = 0
-                
-                for batch_data in parquet_file.iter_batches(batch_size=256, columns=['audio', 'text', 'speaker_id']):
+
+                columns = ['audio', 'transcript', 'phoneme_sequence', 'words', 'phonemes', 'source']
+                for batch_data in parquet_file.iter_batches(batch_size=256, columns=columns):
                     batch_len = len(batch_data)
                     total_count += batch_len
                     if rows_read + batch_len <= skip_count:
                         rows_read += batch_len
                         continue
-                    
+
                     audio_col = batch_data['audio']
-                    raw_text_col = batch_data['text']
-                    speaker_id_col = batch_data['speaker_id']
-                    
-                    for i in range(len(batch_data)):
+                    transcript_col = batch_data['transcript']
+                    phoneme_seq_col = batch_data['phoneme_sequence']
+                    words_col = batch_data['words']
+                    phonemes_col = batch_data['phonemes']
+                    source_col = batch_data['source']
+
+                    for i in range(batch_len):
                         current_row_idx = rows_read + i
                         if current_row_idx < skip_count:
                             continue
 
                         try:
-                            text = str(raw_text_col[i]).strip() if raw_text_col[i] is not None else ""
+                            text = str(transcript_col[i]).strip() if transcript_col[i] is not None else ""
                             if not text:
                                 no_text_count += 1
                                 continue
 
                             audio_struct = audio_col[i].as_py()
                             if not audio_struct:
+                                no_audio_count += 1
                                 continue
 
                             audio_bytes = audio_struct.get('bytes', None)
-                            arr = audio_struct.get('array', None)
-                            if audio_bytes is None and arr is None:
+                            if audio_bytes is None:
                                 no_audio_count += 1
                                 continue
-                            
-                            if audio_bytes is not None:
-                                with io.BytesIO(audio_bytes) as f:
-                                    array, sr = sf.read(f)
-                            elif arr is not None:
-                                sr = audio_struct.get('sampling_rate', 16000)
-                                array = np.array(arr, dtype=np.float32)
+
+                            with io.BytesIO(audio_bytes) as f:
+                                array, sr = sf.read(f)
                             if array.ndim > 1:
                                 array = np.mean(array, axis=1)
-                            
+
                             if MAX_AUDIO_DURATION > 0 and len(array) / sr > MAX_AUDIO_DURATION:
                                 continue
 
-                            spk = speaker_id_col[i]
-                            speaker_id = str(spk).strip() if spk is not None else None
+                            src_tag = source_col[i]
+                            src_tag = str(src_tag).strip() if src_tag is not None else None
+
+                            phoneme_seq_val = phoneme_seq_col[i]
+                            phoneme_seq = str(phoneme_seq_val).strip() if phoneme_seq_val is not None else None
+
+                            words_val = words_col[i].as_py() if words_col[i] is not None else None
+                            phonemes_val = phonemes_col[i].as_py() if phonemes_col[i] is not None else None
 
                             task = ASRTask(
+                                audio_bytes=audio_bytes,
                                 audio_raw=array.astype(np.float16),
                                 sample_rate=int(sr),
                                 text_gt=text,
                                 source_file=parquet_path,
-                                speaker_id=speaker_id or None
+                                source_tag=src_tag or None,
+                                phoneme_sequence=phoneme_seq or None,
+                                words=words_val,
+                                phonemes=phonemes_val,
                             )
                             current_batch.append(task)
 
@@ -159,22 +189,22 @@ class AudioLoaderWorker(Process):
                         except Exception:
                             logger.error(f"Error processing {parquet_path} row {current_row_idx}: {traceback.format_exc()}")
                             continue
-                    
+
                     rows_read += batch_len
-                
-                # 文件处理完后，更新进度条计数器
+
                 with self.file_pbar_counter.get_lock():
                     self.file_pbar_counter.value += 1
-                
+
                 logger.info(f"[Loader-{self.worker_id}] Finished {os.path.basename(parquet_path)}")
                 logger.info(f"[Loader-{self.worker_id}] No text count: {no_text_count}, No audio count: {no_audio_count}, Total count: {total_count}")
 
             except Exception as e:
                 logger.error(f"Error loading {parquet_path}: {e}")
-        
+
         if current_batch:
             self.gpu_task_queue.put(current_batch)
         logger.info(f"[CPU-Loader-{self.worker_id}] Finished.")
+
 
 class GPUASRWorker(Process):
     def __init__(self, input_queue: Queue, output_queue: Queue, gpu_id: int, worker_id: int):
@@ -193,40 +223,40 @@ class GPUASRWorker(Process):
         while True:
             try:
                 tasks = self.input_queue.get(timeout=30)
-                if tasks is None: break
-            except queue.Empty: continue
+                if tasks is None:
+                    break
+            except queue.Empty:
+                continue
 
             for task in tasks:
                 try:
                     audio_fp32 = task.audio_raw.astype(np.float32)
-                    audio_tensor = torch.from_numpy(audio_fp32).to(device_str)
-                    
+
                     if task.sample_rate != 16000:
+                        audio_tensor = torch.from_numpy(audio_fp32).to(device_str)
                         if task.sample_rate not in resamplers:
                             resamplers[task.sample_rate] = torchaudio.transforms.Resample(task.sample_rate, 16000).to(device_str)
                         audio_16k = resamplers[task.sample_rate](audio_tensor).cpu().numpy()
                     else:
-                        audio_16k = audio_fp32 
-                    
-                    # 推理
+                        audio_16k = audio_fp32
+
                     segments_gen, info = model.transcribe(audio_16k, beam_size=1, vad_filter=True)
                     segments_list = [{"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text.strip()} for s in segments_gen]
                     text_pred = "".join([s["text"] for s in segments_list]).strip()
-                    
+
                     gt_clean = task.text_gt.strip()
                     gt_norm = normalize_text_for_cer(gt_clean)
                     pred_norm = normalize_text_for_cer(text_pred)
                     error_rate = cer(gt_norm, pred_norm) if len(gt_norm) > 0 else 1.0
 
-                    buf = io.BytesIO()
-                    sf.write(buf, task.audio_raw.astype(np.float32), task.sample_rate, format="WAV")
-                    buf.seek(0)
-                    audio_bytes = buf.read()
-
                     self.output_queue.put({
-                        "audio": audio_bytes,
+                        "audio": task.audio_bytes,
                         "text": task.text_gt,
-                        "speaker": task.speaker_id,
+                        "speaker": None,
+                        "source_tag": task.source_tag,
+                        "phoneme_sequence": task.phoneme_sequence,
+                        "words": task.words,
+                        "phonemes": task.phonemes,
                         "whisper_large_v3": {
                             "text": text_pred,
                             "cer": float(error_rate),
@@ -237,6 +267,7 @@ class GPUASRWorker(Process):
                     })
                 except Exception as e:
                     logger.error(f"Inference error on {device_str}: {e}")
+
 
 class ParquetWriterWorker(Process):
     def __init__(self, result_queue: Queue, output_dir: str, save_interval: int, checkpoint_path: str, initial_checkpoint: dict):
@@ -250,22 +281,22 @@ class ParquetWriterWorker(Process):
     def run(self):
         os.makedirs(self.output_dir, exist_ok=True)
         buffer = []
-        current_cycle_counts = {} 
-        
+        current_cycle_counts = {}
+
         existing_parts = glob.glob(os.path.join(self.output_dir, "part_*.parquet"))
         file_idx = max([int(os.path.basename(f).split('_')[1].split('.')[0]) for f in existing_parts]) + 1 if existing_parts else 0
-        
-        # 样本进度条
+
         pbar = tqdm(desc="Samples Processed", unit="audios", dynamic_ncols=True)
 
         while True:
             try:
                 data = self.result_queue.get(timeout=20)
-                if data == "DONE": break
-                
+                if data == "DONE":
+                    break
+
                 src_file = data.pop("_source_file")
                 current_cycle_counts[src_file] = current_cycle_counts.get(src_file, 0) + 1
-                
+
                 buffer.append(data)
                 pbar.update(1)
 
@@ -288,13 +319,14 @@ class ParquetWriterWorker(Process):
     def _save(self, data_list, idx, cycle_counts):
         save_path = os.path.join(self.output_dir, f"part_{idx:04d}.parquet")
         pd.DataFrame(data_list).to_parquet(save_path, engine='pyarrow', index=False)
-        
+
         for src, count in cycle_counts.items():
             self.checkpoint[src] = self.checkpoint.get(src, 0) + count
-        
+
         with open(self.checkpoint_path, 'w', encoding='utf-8') as f:
             json.dump(self.checkpoint, f, indent=2, ensure_ascii=False)
         logger.info(f"Checkpoint saved. Part {idx} contains {len(data_list)} samples.")
+
 
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_PATH):
@@ -305,28 +337,28 @@ def load_checkpoint():
             return {}
     return {}
 
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     checkpoint = load_checkpoint()
-    
-    all_parquet_files = sorted(glob.glob(os.path.join(DATASET_ROOT, "**/*.parquet"), recursive=True))
+
+    search_root = os.path.join(DATASET_ROOT, LANG_SUBDIR)
+    all_parquet_files = sorted(glob.glob(os.path.join(search_root, "**/*.parquet"), recursive=True))
     total_files = len(all_parquet_files)
-    
+    logger.info(f"Found {total_files} parquet files under {search_root}")
+
     file_queue = Queue()
     for f in all_parquet_files:
         file_queue.put(f)
-    
-    # 共享变量用于更新文件进度条
+
     file_pbar_counter = Value('i', 0)
-    
-    gpu_task_queue = Queue(maxsize=DEVICE_NUM * 16) 
+
+    gpu_task_queue = Queue(maxsize=DEVICE_NUM * 16)
     result_queue = Queue()
 
-    # 启动 Writer
     writer = ParquetWriterWorker(result_queue, OUTPUT_DIR, SAVE_INTERVAL, CHECKPOINT_PATH, checkpoint)
     writer.start()
 
-    # 启动 GPU Workers
     gpu_workers = []
     for gpu_id in range(DEVICE_NUM):
         for w_id in range(PROCESSORS_PER_DEVICE):
@@ -334,14 +366,12 @@ def main():
             p.start()
             gpu_workers.append(p)
 
-    # 启动 CPU Loaders
     cpu_workers = []
     for i in range(CPU_WORKERS_NUM):
         p = AudioLoaderWorker(file_queue, gpu_task_queue, i, checkpoint, file_pbar_counter)
         p.start()
         cpu_workers.append(p)
 
-    # 主进程监控总文件进度
     with tqdm(total=total_files, desc="Files Progress", unit="file", dynamic_ncols=True) as fbar:
         last_val = 0
         while any(p.is_alive() for p in cpu_workers):
@@ -350,15 +380,17 @@ def main():
                 fbar.update(curr_val - last_val)
                 last_val = curr_val
             time.sleep(1)
-        # 最后补齐
         fbar.update(total_files - last_val)
 
-    # 等待完成并清理
-    for p in cpu_workers: p.join()
-    for _ in gpu_workers: gpu_task_queue.put(None)
-    for p in gpu_workers: p.join()
+    for p in cpu_workers:
+        p.join()
+    for _ in gpu_workers:
+        gpu_task_queue.put(None)
+    for p in gpu_workers:
+        p.join()
     result_queue.put("DONE")
     writer.join()
+
 
 if __name__ == "__main__":
     main()

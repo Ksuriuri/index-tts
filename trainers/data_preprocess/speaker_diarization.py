@@ -26,9 +26,10 @@ from pyannote.audio import Pipeline
 # DATASET_NAME = "Emilia-YODAS_JA"
 # DATASET_NAME = "Japanese-Eroge-Voice"
 
-DATASET_NAME = "Spanish/MLS_Spanish"
+# DATASET_NAME = "Spanish/MLS_Spanish"
 # DATASET_NAME = "Spanish/voxpopuli"
 # DATASET_NAME = "Spanish/google-chilean-spanish"
+DATASET_NAME = "Spanish/maa"
 
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 HF_TOKEN = os.environ.get('HF_TOKEN', None)

@@ -48,6 +48,9 @@ random.seed(42)
 
 DATASET_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATASET_ROOTS = [
+    f"{DATASET_ROOT}/Emilia_JA",
+    f"{DATASET_ROOT}/Emilia-YODAS_JA",
+    f"{DATASET_ROOT}/Gacha_games_jp",
     f"{DATASET_ROOT}/google-chilean-spanish",
     f"{DATASET_ROOT}/MLS_Spanish",
     f"{DATASET_ROOT}/voxpopuli",
@@ -55,10 +58,10 @@ DATASET_ROOTS = [
 
 EMO_SYNTHESIS_ROOT = "/mnt/data_3t_1/datasets/preprocess/emo_synthesis_data"
 
-OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2"
+OUTPUT_DIR = f"/mnt/data_3t_2/datasets/indextts_train_data_v2/jp_es"
 
 MODEL_DIR = "./checkpoints/IndexTTS-2-vLLM"
-BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_bpe.model")
+BPE_MODEL_PATH = os.path.join(MODEL_DIR, "jp_es_bpe.model")
 TARGET_SR = 16000
 CPU_WORKERS_NUM = 1  # 负责读取和解码的CPU进程数
 DEVICE_NUM = 8
@@ -177,7 +180,8 @@ class DataPreprocessorReqData:
     text: str
     audio: torch.Tensor
     emo_audio: torch.Tensor
-    orig_sr: int
+    audio_sr: int
+    emo_sr: int
     file_rel_path: str
     original_index: int
     speaker_id: str = None
@@ -316,14 +320,14 @@ class DataPreprocessor(Process):
         emo_audio_tensors = []
         for d in input_data_list:
             wav = d.audio.to(self.device, non_blocking=True)
-            if d.orig_sr != TARGET_SR:
-                resampler = self.get_resampler(d.orig_sr)
+            if d.audio_sr != TARGET_SR:
+                resampler = self.get_resampler(d.audio_sr)
                 wav = resampler(wav)
             audio_tensors.append(wav)
 
             emo_wav = d.emo_audio.to(self.device, non_blocking=True)
-            if d.orig_sr != TARGET_SR:
-                resampler = self.get_resampler(d.orig_sr)
+            if d.emo_sr != TARGET_SR:
+                resampler = self.get_resampler(d.emo_sr)
                 emo_wav = resampler(emo_wav)
             emo_audio_tensors.append(emo_wav)
         
@@ -602,7 +606,8 @@ class AudioLoaderWorker(Process):
                                 text=text,
                                 audio=audio_tensor,  # float32
                                 emo_audio=emo_audio_tensor,  # float32
-                                orig_sr=sampling_rate,
+                                audio_sr=sampling_rate,
+                                emo_sr=emo_sampling_rate,
                                 file_rel_path=rel_path,
                                 original_index=current_file_index
                             )

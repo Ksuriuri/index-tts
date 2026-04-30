@@ -16,38 +16,42 @@ from concurrent.futures import ProcessPoolExecutor
 # ================= 配置区域 (保持不变) =================
 
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
-DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
-TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/jp_260418"
+DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2/jp_es"
+TARGET_DIR = f"/mnt/data_3t_2/datasets/final_train_data/es_260429"
 
 SOURCE_NAMES = {
-    # jp
-    "Emilia_JA": 0.15,
-    "Emilia-YODAS_JA": 0.15,
-    "Gacha_games_jp": 0.20,
-    # synthesis
-    "Galgame-VisualNovel-Reupload": 0.10,
-    "Japanese-Eroge-Voice": 0.10,
+    # # jp
+    # "Emilia_JA": 0.15,
+    # "Emilia-YODAS_JA": 0.15,
+    # "Gacha_games_jp": 0.20,
+    # # synthesis
+    # "Galgame-VisualNovel-Reupload": 0.10,
+    # "Japanese-Eroge-Voice": 0.10,
 
-    # # es
-    # "google-chilean-spanish": 0.20,
-    # "MLS_Spanish": 0.20,
-    # "voxpopuli": 0.20,
+    # es
+    "google-chilean-spanish": 0.20,
+    "MLS_Spanish": 0.20,
+    "voxpopuli": 0.20,
+    # synthesis
+    "maa": 0.20,
 }
 
 # 每个 source 单独配置尾部静音过滤范围 (min_sec, max_sec)，只有在此 dict 中的 source 才启用过滤
 END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
-    # jp
-    "Emilia_JA": (0.1, 0.7),
-    "Emilia-YODAS_JA": (0.1, 0.7),
-    "Gacha_games_jp": (0.1, 0.7),
-    # synthesis
-    "Galgame-VisualNovel-Reupload": (0.1, 0.7),
-    "Japanese-Eroge-Voice": (0.1, 0.7),
+    # # jp
+    # "Emilia_JA": (0.1, 0.7),
+    # "Emilia-YODAS_JA": (0.1, 0.7),
+    # "Gacha_games_jp": (0.1, 0.7),
+    # # synthesis
+    # "Galgame-VisualNovel-Reupload": (0.1, 0.7),
+    # "Japanese-Eroge-Voice": (0.1, 0.7),
 
-    # # es
-    # "google-chilean-spanish": (0.0, 0.7),
-    # "MLS_Spanish": (0.0, 0.7),
-    # "voxpopuli": (0.0, 0.7),
+    # es
+    "google-chilean-spanish": (0.0, 0.7),
+    "MLS_Spanish": (0.0, 0.7),
+    "voxpopuli": (0.0, 0.7),
+    # synthesis
+    "maa": (0.0, 0.7),
 }
 
 SHARD_SIZE = 40000 
@@ -69,19 +73,34 @@ SOURCE_CER_TYPES: Dict[str, str] = {
 # 控制哪些 source 可以使用 emo_vec（USE_EMO_VEC_PROB 的概率保留，否则置零），不在列表中的 source 全部置零
 USE_EMO_VEC_PROB = 1.0  # 0.5
 EMO_VEC_SOURCES: List[str] = [
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    "Gacha_games_jp",
+    # # jp
+    # "Emilia_JA",
+    # "Emilia-YODAS_JA",
+    # "Gacha_games_jp",
+    # # synthesis
     # "Galgame-VisualNovel-Reupload",
     # "Japanese-Eroge-Voice",
+
+    # es
+    "google-chilean-spanish",
+    "MLS_Spanish",
+    "voxpopuli",
+    # synthesis
+    "maa",
 ]
 
 # 这些 source 在同一 shard 内若某个 speaker_id 仅出现 1 条样本，则丢弃该样本
 # （目的：保证同 speaker 的 condition 错排能够生效）
 REQUIRE_MULTI_SAMPLE_SOURCES: List[str] = [
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    "Gacha_games_jp",
+    # # jp
+    # "Emilia_JA",
+    # "Emilia-YODAS_JA",
+    # "Gacha_games_jp",
+
+    # es
+    "google-chilean-spanish",
+    "MLS_Spanish",
+    "voxpopuli",
 ]
 
 # 并行配置
@@ -272,7 +291,7 @@ def save_shard_task(data_items: List[Dict], shard_index: int, output_dir: str):
         # --- Speaker Condition Shuffle 逻辑 ---
         speaker_groups = defaultdict(list)
         for idx, item in enumerate(data_items):
-            speaker_groups[item['speaker_id']].append(idx)
+            speaker_groups[(item.get('source'), item['speaker_id'])].append(idx)
 
         for spk, indices in speaker_groups.items():
             n_samples = len(indices)

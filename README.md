@@ -55,6 +55,7 @@ conda 环境：`index-tts`
 - 生成文本：提取原文件中长度小于100且大于10的文本组成数组，从中随机选择
 
 ### 3.6 生成情感参考音频
+- 当前仅对有说话人标签的数据使用
 - 使用 `trainers/data_preprocess/emo_synthesis.py`
 
 ### 4. 预处理训练数据

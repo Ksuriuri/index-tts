@@ -41,7 +41,7 @@ except RuntimeError:
 DATASET_ROOT = "/mnt/data_3t_1/datasets/raw_data/Spanish/MLS-Spanish/mls_spanish/train"
 AUDIO_DIR = os.path.join(DATASET_ROOT, "audio")
 TRANSCRIPTS_PATH = os.path.join(DATASET_ROOT, "transcripts.txt")
-OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/Spanish/MLS_Spanish"
+OUTPUT_DIR = "/mnt/data_3t_1/datasets/preprocess/MLS_Spanish"
 CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint.json")
 
 WHISPER_MODEL_SIZE = "large-v3"

@@ -19,37 +19,41 @@ from trainers.utils import ProcessedData
 
 # ================= 配置区域 =================
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
-DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2"
+DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2/jp_es"
 
 SOURCE_NAMES = {
-    # jp
-    "Emilia_JA": 0.15,
-    "Emilia-YODAS_JA": 0.15,
-    "Gacha_games_jp": 0.20,
-    # synthesis
-    "Galgame-VisualNovel-Reupload": 0.10,
-    "Japanese-Eroge-Voice": 0.10,
+    # # jp
+    # "Emilia_JA": 0.15,
+    # "Emilia-YODAS_JA": 0.15,
+    # "Gacha_games_jp": 0.20,
+    # # synthesis
+    # "Galgame-VisualNovel-Reupload": 0.10,
+    # "Japanese-Eroge-Voice": 0.10,
 
-    # # es
-    # "google-chilean-spanish": 0.20,
-    # "MLS_Spanish": 0.20,
-    # "voxpopuli": 0.20,
+    # es
+    "google-chilean-spanish": 0.20,
+    "MLS_Spanish": 0.20,
+    "voxpopuli": 0.20,
+    # synthesis
+    "maa": 0.20,
 }
 
 # 每个 source 单独配置尾部静音过滤范围 (min_sec, max_sec)，只有在此 dict 中的 source 才启用过滤
 END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
-    # jp
-    "Emilia_JA": (0.1, 0.7),
-    "Emilia-YODAS_JA": (0.1, 0.7),
-    "Gacha_games_jp": (0.1, 0.7),
-    # synthesis
-    "Galgame-VisualNovel-Reupload": (0.1, 0.7),
-    "Japanese-Eroge-Voice": (0.1, 0.7),
+    # # jp
+    # "Emilia_JA": (0.1, 0.7),
+    # "Emilia-YODAS_JA": (0.1, 0.7),
+    # "Gacha_games_jp": (0.1, 0.7),
+    # # synthesis
+    # "Galgame-VisualNovel-Reupload": (0.1, 0.7),
+    # "Japanese-Eroge-Voice": (0.1, 0.7),
     
-    # # es
-    # "google-chilean-spanish": (0.0, 0.7),
-    # "MLS_Spanish": (0.0, 0.7),
-    # "voxpopuli": (0.0, 0.7),
+    # es
+    "google-chilean-spanish": (0.0, 0.7),
+    "MLS_Spanish": (0.0, 0.7),
+    "voxpopuli": (0.0, 0.7),
+    # synthesis
+    "maa": (0.0, 0.7),
 }
 
 SHARD_SIZE = 40000 
@@ -73,9 +77,15 @@ SOURCE_CER_TYPES: Dict[str, str] = {
 #   注意此处采用 per-source 全局粒度，convert 脚本是 per-shard 粒度，统计值
 #   作为 convert 结果的上界参考。）
 REQUIRE_MULTI_SAMPLE_SOURCES: List[str] = [
-    "Emilia_JA",
-    "Emilia-YODAS_JA",
-    "Gacha_games_jp",
+    # # jp
+    # "Emilia_JA",
+    # "Emilia-YODAS_JA",
+    # "Gacha_games_jp",
+
+    # es
+    "google-chilean-spanish",
+    "MLS_Spanish",
+    "voxpopuli",
 ]
 
 # 并行相关配置

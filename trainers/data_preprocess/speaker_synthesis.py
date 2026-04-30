@@ -18,8 +18,10 @@ from torch.multiprocessing import Process, Queue, Value
 import soundfile as sf
 
 
-DATASET_NAME = "Galgame-VisualNovel-Reupload"
+# DATASET_NAME = "Galgame-VisualNovel-Reupload"
 # DATASET_NAME = "Japanese-Eroge-Voice"
+DATASET_NAME = "maa"
+
 DATASET_DIR = f"/mnt/data_3t_1/datasets/preprocess/{DATASET_NAME}"
 OUTPUT_DIR = f"/mnt/data_3t_1/datasets/preprocess/synthesis_data/{DATASET_NAME}"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -35,13 +37,17 @@ with open("/mnt/data_sdd/hhy/index-tts/assets/tts_dataset.txt", "r", encoding="u
 MIN_AUDIO_DURATION = 3  # 6
 MAX_AUDIO_DURATION = 30  # 36
 
-CER_THRESHOLD = 0.20  # 0.10
-# CER_TYPE = "cer"
-CER_TYPE = "pron_CER"
+# for jp
+# CER_THRESHOLD = 0.20
+# CER_TYPE = "pron_CER"
+
+# for es
+CER_THRESHOLD = 0.30
+CER_TYPE = "cer"
 
 # --- 新的配置参数 ---
 NUM_TTS_PORTS = 8           # 端口数量 (0-7)
-MAX_REQ_PER_PORT = 16       # 每个端口最大并发
+MAX_REQ_PER_PORT = 4       # 每个端口最大并发
 TOTAL_CONCURRENCY = NUM_TTS_PORTS * MAX_REQ_PER_PORT # 总并发 256
 
 try:
