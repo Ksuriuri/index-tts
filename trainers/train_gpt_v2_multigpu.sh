@@ -6,8 +6,8 @@ accelerate launch \
     --config checkpoints/IndexTTS-2-vLLM/config.yaml \
     --tokenizer checkpoints/IndexTTS-2-vLLM/jp_es_bpe.model \
     --base-checkpoint checkpoints/IndexTTS-2-vLLM/gpt.pth \
-    --train-data-dir \
-    /mnt/data_3t_2/datasets/final_train_data/es_260422 \
+    --train-data-dirs \
+    /mnt/data_3t_2/datasets/final_train_data/es_260503 \
     --val-data-size 128 \
     --output-dir ./trained_ckpts \
     --batch-size-per-device 4 \
@@ -20,8 +20,9 @@ accelerate launch \
     --save_every 2500 \
     --keep-last 4 \
     --major-save-every 25000 \
+    --resume auto \
     --use-duration-control \
     --duration-dropout 0.3 \
     --wandb-project "IndexTTS2-jp" \
-    --wandb-run-name "es_e3_emo_and_syn_260428"
+    --wandb-run-name "es_e3_emo_and_syn_260503"
     # --no-emo-vec \

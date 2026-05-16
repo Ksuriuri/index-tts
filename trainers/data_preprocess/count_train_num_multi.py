@@ -11,13 +11,8 @@ from collections import defaultdict
 from tqdm.contrib.concurrent import process_map  # 核心并行库
 from functools import partial
 
-# 假设原始项目结构保留
-root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(root_dir)
-
-from trainers.utils import ProcessedData
-
 # ================= 配置区域 =================
+
 PREPROCESS_ROOT = "/mnt/data_3t_1/datasets/preprocess"
 DATA_ROOT = "/mnt/data_3t_2/datasets/indextts_train_data_v2/jp_es"
 
@@ -47,7 +42,7 @@ END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
     # # synthesis
     # "Galgame-VisualNovel-Reupload": (0.1, 0.7),
     # "Japanese-Eroge-Voice": (0.1, 0.7),
-    
+
     # es
     "google-chilean-spanish": (0.0, 0.7),
     "MLS_Spanish": (0.0, 0.7),
@@ -56,7 +51,6 @@ END_SILENCE_FILTER: Dict[str, tuple[float, float]] = {
     "maa": (0.0, 0.7),
 }
 
-SHARD_SIZE = 40000 
 MIN_DURATION = 0
 MAX_DURATION = 36
 MIN_TEXT_TOKENS = 1
@@ -88,14 +82,19 @@ REQUIRE_MULTI_SAMPLE_SOURCES: List[str] = [
     "voxpopuli",
 ]
 
-# 并行相关配置
-MAX_WORKERS = 8  # os.cpu_count()  # 使用所有 CPU 核心，也可以手动指定如 16
+# 并行配置
+NUM_WORKERS = 8  # os.cpu_count()  # 使用所有 CPU 核心，也可以手动指定如 16
+
+root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(root_dir)
+
+from trainers.utils import ProcessedData
 
 def get_parquet_path(pkl_path: str, source_name: str) -> str:
     try:
         path_parts = pkl_path.split(os.sep)
         if source_name not in path_parts:
-             return None
+            return None
         idx = path_parts.index(source_name)
         rel_path = os.sep.join(path_parts[idx+1:])
         rel_path = rel_path.replace('.pkl', '.parquet')
@@ -206,13 +205,19 @@ def process_single_file(args):
             
             # --- 过滤逻辑开始 ---
             
-            # A. CER 过滤
+            # CER 过滤
             cer = whisper_info.get(cer_type, 1.0)
             if cer > cer_threshold:
                 stats["cer_skip"] += 1
                 continue
-            
-            # B. 尾部静音过滤
+
+            # Diarization 过滤
+            unique_speakers = set(seg.get('speaker', '') if isinstance(seg, dict) else seg['speaker'] for seg in speaker_diar)
+            if len(unique_speakers) != 1:
+                stats["diarization_skip"] += 1
+                continue
+
+            # 尾部静音过滤
             if source_name in END_SILENCE_FILTER:
                 end_silence_min, end_silence_max = END_SILENCE_FILTER[source_name]
                 total_duration = processed_data.duration
@@ -226,14 +231,8 @@ def process_single_file(args):
                 if skip_flag:
                     stats["silence_skip"] += 1
                     continue
-            
-            # C. 说话人 Diarization 过滤
-            unique_speakers = set(seg.get('speaker', '') if isinstance(seg, dict) else seg['speaker'] for seg in speaker_diar)
-            if len(unique_speakers) != 1:
-                stats["diarization_skip"] += 1
-                continue
 
-            # D. 基础长度/时长过滤
+            # 基础长度/时长过滤
             if (processed_data.duration < MIN_DURATION or 
                 processed_data.duration > MAX_DURATION or 
                 processed_data.text_len < MIN_TEXT_TOKENS or 
@@ -290,7 +289,7 @@ def main():
     results = process_map(
         process_single_file, 
         all_tasks, 
-        max_workers=MAX_WORKERS, 
+        max_workers=NUM_WORKERS, 
         chunksize=1, 
         desc="Parallel Processing"
     )

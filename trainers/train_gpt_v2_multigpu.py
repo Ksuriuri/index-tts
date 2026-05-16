@@ -509,6 +509,7 @@ def main() -> None:
     # 6. Resume from checkpoint (if needed)
     global_step = 0
     start_epoch = 0
+    resume_batches_to_skip = 0
     if args.resume:
         if args.resume == "auto":
             # 简单的自动查找逻辑
@@ -525,13 +526,17 @@ def main() -> None:
         if resume_path and os.path.exists(resume_path):
             accelerator.print(f"[Info] Resuming from {resume_path}")
             accelerator.load_state(resume_path)
-            # 计算 global_step 和 start_epoch 的大致位置 (非精确，仅用于显示)
-            # 如果要精确控制，需要单独保存 step 到文件或从路径名解析
             try:
                 # 假设文件夹名字是 checkpoint-{step}
                 step_val = int(Path(resume_path).name.split("-")[-1])
                 global_step = step_val
-                start_epoch = global_step // (len(train_loader) // args.grad_accumulation)
+                start_epoch = global_step // num_update_steps_per_epoch
+                resume_step_in_epoch = global_step % num_update_steps_per_epoch
+                resume_batches_to_skip = resume_step_in_epoch * args.grad_accumulation
+                accelerator.print(
+                    f"[Info] Resume position: epoch={start_epoch + 1}, "
+                    f"global_step={global_step}, skip_batches={resume_batches_to_skip}"
+                )
             except:
                 pass
         else:
@@ -543,7 +548,14 @@ def main() -> None:
     progress_bar.update(global_step)
 
     for epoch in range(start_epoch, args.epochs):
-        for batch_idx, batch in enumerate(train_loader):
+        active_train_loader = train_loader
+        skipped_batches = 0
+        if epoch == start_epoch and resume_batches_to_skip > 0:
+            active_train_loader = accelerator.skip_first_batches(train_loader, resume_batches_to_skip)
+            skipped_batches = resume_batches_to_skip
+
+        for batch_idx, batch in enumerate(active_train_loader):
+            logical_batch_idx = batch_idx + skipped_batches
             # Gradient Accumulation Context
             with accelerator.accumulate(model):
                 mel_loss, metrics = model(batch)
@@ -574,7 +586,7 @@ def main() -> None:
                             "train/mel_loss": mel_loss.item(),
                             "train/mel_top1": metrics["mel_top1"].item(),
                             "train/lr": lr,
-                            "train/epoch": epoch + (batch_idx / len(train_loader)),
+                            "train/epoch": epoch + (logical_batch_idx / len(train_loader)),
                         },
                         step=global_step,
                     )
