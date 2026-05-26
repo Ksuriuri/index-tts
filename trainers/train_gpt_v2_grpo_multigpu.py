@@ -103,13 +103,22 @@ def parse_args() -> argparse.Namespace:
                         help="Suffix of reference audio files (e.g. .flac, .wav).")
     parser.add_argument("--max-group-size", type=int, default=8,
                         help="Per-group cap on (chosen + rejected) candidates.")
-    parser.add_argument("--max-audio-duration", type=float, default=20.0,
-                        help="Drop candidate audios longer than this many seconds.")
+    parser.add_argument("--min-group-count", type=int, default=3,
+                        help="Drop groups whose total candidate count is below this value. "
+                             "Uses metadata `total_count` when present, otherwise "
+                             "len(chosen) + len(rejected).")
+    parser.add_argument("--max-audio-duration", type=float, default=36.0,
+                        help="Drop candidate (chosen/rejected) audios longer than this many seconds. "
+                             "Candidates are NEVER truncated -- truncating would break the "
+                             "text<->audio alignment used by teacher-forcing.")
     parser.add_argument("--min-audio-duration", type=float, default=0.5,
                         help="Drop audios shorter than this many seconds.")
-    parser.add_argument("--max-ref-duration", type=float, default=15.0,
-                        help="Truncate reference audio to this many seconds. "
-                             "Inference (`_load_and_cut_audio`) caps at 15s.")
+    parser.add_argument("--max-ref-duration", type=float, default=36.0,
+                        help="Drop the entire group when the speaker-reference audio is "
+                             "longer than this many seconds.  Reference audio is NEVER "
+                             "truncated either: a 36 s ref summarised through the (frozen) "
+                             "conditioning encoder differs from a 36-s-truncated-to-15-s ref, "
+                             "so training and inference would silently diverge.")
 
     # Model
     parser.add_argument("--tokenizer", type=Path,
@@ -124,6 +133,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref-checkpoint", type=Path, default=None,
                         help="Optional separate checkpoint for the reference model. "
                              "Defaults to --base-checkpoint.")
+    parser.add_argument("--ref-dtype", type=str, default="fp16",
+                        choices=["fp16", "bf16", "fp32"],
+                        help="Dtype to hold the reference GPT in (default: fp16). "
+                             "fp16 halves the per-GPU memory cost and is the closest "
+                             "match to inference; switch to bf16 (or fp32) if you "
+                             "observe NaNs / Infs in logp_ref during training.")
     parser.add_argument("--model-dir", type=Path,
                         default=Path("checkpoints/IndexTTS-2-vLLM"),
                         help="Dir containing w2v-bert-2.0/, semantic_codec/, wav2vec2bert_stats.pt.")
@@ -145,6 +160,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--no-ref-cache",
+        action="store_true",
+        help=(
+            "Disable the in-memory cache of per-reference-audio features "
+            "(conditioning / emo_vec_base / style).  Caching is enabled by "
+            "default and skips the (frozen) w2v-bert + Conformer / Perceiver "
+            "passes for any reference audio we've already seen this run.  "
+            "Memory cost: ~166 KB / unique ref audio on CPU (~376 MB total "
+            "for the noiz-v2 multigen metadata)."
+        ),
+    )
+    parser.add_argument(
+        "--ref-cache-max-entries",
+        type=int,
+        default=0,
+        help=(
+            "Upper bound on the number of cached ref-audio entries.  0 = "
+            "unbounded (default), since the dataset only has a few thousand "
+            "unique voice ids.  Set this if you ever train on a corpus with "
+            "millions of unique speakers and want to cap CPU memory."
+        ),
+    )
 
     # GRPO hyper-params
     parser.add_argument("--clip-eps", type=float, default=0.2)
@@ -159,6 +197,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-rejected", type=float, default=0.0)
     parser.add_argument("--kl-estimator", type=str, default="k3", choices=["k1", "k3"],
                         help="KL approximation: k1=logp_ref - logp_pi, k3=exp(d) - d - 1, d=logp_ref-logp_pi.")
+
+    # Trainable-parameter scope
+    parser.add_argument(
+        "--train-scope",
+        type=str,
+        default="body_and_head",
+        choices=["body_and_head", "lm_core", "body_only"],
+        help=(
+            "Which UnifiedVoice parameters to update.  "
+            "'body_and_head' (default, Hybrid): freeze all embeddings + conditioning/emo "
+            "encoders, train GPT body + final_norm + mel_head.  "
+            "'lm_core': also train text/mel embeddings and position embeddings (SFT-style).  "
+            "'body_only': train GPT body + final_norm only (no mel_head)."
+        ),
+    )
+    parser.add_argument(
+        "--gpt-train-mode",
+        type=str,
+        default="full",
+        choices=["full", "attention_only"],
+        help=(
+            "How much of the GPT-2 stack to update within --train-scope.  "
+            "'full' (default): all transformer blocks (attn + MLP + LayerNorm).  "
+            "'attention_only': only self-attention projections inside each block; "
+            "FFN / block LayerNorm stay frozen."
+        ),
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Enable HF GPT-2 gradient checkpointing on the *policy* model only "
+            "(reference runs under no_grad so it gets nothing).  Saves ~30-50% "
+            "peak VRAM on the transformer activations at ~20-30% slower forward.  "
+            "Uses ``use_reentrant=False`` so it stays compatible with our frozen "
+            "embedding / pre-computed conditioning inputs."
+        ),
+    )
 
     # Duration control (mirrors SFT script)
     parser.add_argument("--use-duration-control", action="store_true")
@@ -184,7 +260,14 @@ def parse_args() -> argparse.Namespace:
 # =============================================================================
 
 class GPUFeatureExtractor(nn.Module):
-    """Batched GPU drop-in replacement for SeamlessM4TFeatureExtractor."""
+    """Batched GPU drop-in replacement for SeamlessM4TFeatureExtractor.
+
+    Always computes in fp32: the very first op is ``audio * 2**15`` which
+    immediately overflows fp16 (max ~65504), and the downstream FFT / log
+    operations are precision-sensitive.  The class explicitly disables AMP
+    autocast in ``forward`` so it remains safe to call from inside a wider
+    ``accelerator.autocast()`` block.
+    """
 
     def __init__(self, mel_filters_np, window_np, num_mel_bins=80, stride=2):
         super().__init__()
@@ -201,12 +284,18 @@ class GPUFeatureExtractor(nn.Module):
 
     @torch.no_grad()
     def forward(self, audios: List[torch.Tensor]) -> dict:
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            return self._forward_fp32(audios)
+
+    def _forward_fp32(self, audios: List[torch.Tensor]) -> dict:
         device = audios[0].device
         batch_size = len(audios)
+        # Ensure inputs are fp32 even if caller is inside autocast.
+        audios = [a.float() if a.dtype != torch.float32 else a for a in audios]
         lengths = [a.shape[0] for a in audios]
         max_len = max(lengths)
 
-        padded = torch.zeros(batch_size, max_len, device=device)
+        padded = torch.zeros(batch_size, max_len, device=device, dtype=torch.float32)
         for i, a in enumerate(audios):
             padded[i, :lengths[i]] = a
         padded = padded * self.scale
@@ -276,10 +365,26 @@ class GroupItem:
     candidates: List[GroupSample]
     group_key: str
     emo_control_vector: Optional[torch.Tensor] = None  # float32 [8], from text tags
+    ref_audio_stem: Optional[str] = None  # stable cache key for the speaker ref audio
 
 
-def _read_audio_to_16k(path: str, max_seconds: Optional[float] = None) -> Optional[torch.Tensor]:
-    """Load audio, mono-mix, resample to 16k, optional truncate. Returns None on failure."""
+def _read_audio_to_16k(
+    path: str,
+    max_seconds: Optional[float] = None,
+    truncate: bool = False,
+) -> Optional[torch.Tensor]:
+    """Load audio, mono-mix, resample to 16k. Returns None on failure.
+
+    When ``max_seconds`` is set:
+      - ``truncate=False`` (default, used for chosen/rejected candidates):
+        return ``None`` if the audio is longer than ``max_seconds``.  We must
+        never silently truncate a candidate because that would break the
+        text->audio alignment used by teacher forcing and corrupt the GRPO
+        reward signal.
+      - ``truncate=True`` (used for the speaker reference): clip to
+        ``max_seconds``.  This matches inference's ``_load_and_cut_audio``
+        which caps the reference voice at 15 s for the conditioning encoder.
+    """
     try:
         wav, sr = sf.read(path, dtype="float32")
     except Exception:
@@ -294,7 +399,10 @@ def _read_audio_to_16k(path: str, max_seconds: Optional[float] = None) -> Option
     if max_seconds is not None:
         max_samples = int(max_seconds * TARGET_SR)
         if wav_t.numel() > max_samples:
-            wav_t = wav_t[:max_samples]
+            if truncate:
+                wav_t = wav_t[:max_samples]
+            else:
+                return None
     return wav_t.contiguous()
 
 
@@ -358,15 +466,124 @@ def parse_text_emotion_tags(raw_text: str) -> Tuple[str, Optional[torch.Tensor]]
     return cleaned, torch.tensor(averaged, dtype=torch.float32)
 
 
+def _resolve_ref_audio_stem(item: Dict[str, Any]) -> Optional[str]:
+    """Resolve the speaker-reference id/path stem from metadata.
+
+    Supported schemas:
+      - ``voice_id`` (current multigen metadata_v2.jsonl)
+      - ``ref_audio_id`` / ``ref_audio_file`` (legacy pairs metadata)
+    """
+    if item.get("ref_audio_id"):
+        return str(item["ref_audio_id"])
+    if item.get("voice_id"):
+        return str(item["voice_id"])
+    ref_file = item.get("ref_audio_file")
+    if ref_file:
+        return Path(str(ref_file)).stem
+    return None
+
+
+def _extract_side_files(
+    records: Any,
+    side: str,
+    gen_product_ids: Optional[List[str]] = None,
+) -> List[str]:
+    """Extract relative audio paths for one label side (chosen / rejected).
+
+    Accepts the current multigen format (list of dicts with ``file``), and
+    falls back to ``gen_product_id`` / ``{side}_gen_product_ids`` when needed.
+    """
+    files: List[str] = []
+    if isinstance(records, list):
+        for rec in records:
+            if isinstance(rec, str) and rec.strip():
+                files.append(rec.strip())
+            elif isinstance(rec, dict):
+                if rec.get("file"):
+                    files.append(str(rec["file"]))
+                elif rec.get("gen_product_id"):
+                    gid = str(rec["gen_product_id"])
+                    files.append(f"{side}/{gid}.flac")
+
+    if not files and gen_product_ids:
+        files = [f"{side}/{gid}.flac" for gid in gen_product_ids if gid]
+
+    # De-duplicate while preserving order.
+    seen = set()
+    unique_files: List[str] = []
+    for path in files:
+        if path not in seen:
+            seen.add(path)
+            unique_files.append(path)
+    return unique_files
+
+
+def _parse_metadata_group(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalise one metadata json object into the internal dataset entry."""
+    ref_stem = _resolve_ref_audio_stem(item)
+    if not ref_stem:
+        return None
+
+    chosen = item.get("chosen") or []
+    rejected = item.get("rejected") or []
+    chosen_files = _extract_side_files(
+        chosen, "chosen", item.get("chosen_gen_product_ids")
+    )
+    rejected_files = _extract_side_files(
+        rejected, "rejected", item.get("rejected_gen_product_ids")
+    )
+    if not chosen_files or not rejected_files:
+        return None
+
+    text = item.get("target_text") or item.get("text") or ""
+    if not text:
+        return None
+
+    text, emo_control_vector = parse_text_emotion_tags(text)
+    if not text:
+        return None
+
+    group_count = item.get("total_count")
+    if group_count is None:
+        group_count = len(chosen_files) + len(rejected_files)
+    else:
+        group_count = int(group_count)
+
+    return {
+        "target_text": text,
+        "emo_control_vector": emo_control_vector,
+        "voice_id": str(item.get("voice_id") or ref_stem),
+        "ref_audio_stem": ref_stem,
+        "chosen_files": chosen_files,
+        "rejected_files": rejected_files,
+        "group_count": group_count,
+        "create_time": item.get("create_time"),
+    }
+
+
 class MultigenGRPODataset(Dataset):
     """Reads metadata_v2.jsonl and emits one group per __getitem__.
 
-    Each line:
+    Supported line formats:
+
+    Current multigen (metadata_v2.jsonl):
       {
         "target_text": str,
         "voice_id": str,
-        "chosen":   [{"file": "chosen/xxx.flac", ...}, ...],
-        "rejected": [{"file": "rejected/xxx.flac", ...}, ...]
+        "create_time": int,
+        "chosen": [{"file": "chosen/xxx.flac", "gen_product_id": str, ...}, ...],
+        "chosen_gen_product_ids": [str, ...],
+        "rejected": [{"file": "rejected/xxx.flac", "gen_product_id": str, ...}, ...],
+        "rejected_gen_product_ids": [str, ...],
+        "total_count": int
+      }
+
+    Legacy pairs-style (still accepted):
+      {
+        "target_text": str,
+        "ref_audio_id": str,
+        "ref_audio_file": "ref_audios/xxx.flac",
+        "chosen": [...], "rejected": [...]
       }
     """
 
@@ -384,6 +601,7 @@ class MultigenGRPODataset(Dataset):
         ref_audio_suffix: str = ".flac",
         reward_chosen: float = 1.0,
         reward_rejected: float = 0.0,
+        min_group_count: int = 3,
     ):
         self.audio_root = Path(audio_root)
         self.ref_audio_root = Path(ref_audio_root)
@@ -396,10 +614,17 @@ class MultigenGRPODataset(Dataset):
         self.ref_audio_suffix = ref_audio_suffix
         self.reward_chosen = reward_chosen
         self.reward_rejected = reward_rejected
+        self.min_group_count = min_group_count
 
         print(f"[Dataset] Loading metadata from {metadata_path} ...")
         self.entries: List[Dict[str, Any]] = []
         kept, dropped = 0, 0
+        dropped_reasons = {
+            "parse_error": 0,
+            "invalid_group": 0,
+            "too_small": 0,
+            "empty_text": 0,
+        }
         with open(metadata_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -409,29 +634,31 @@ class MultigenGRPODataset(Dataset):
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     dropped += 1
+                    dropped_reasons["parse_error"] += 1
                     continue
-                chosen = item.get("chosen") or []
-                rejected = item.get("rejected") or []
-                if len(chosen) == 0 or len(rejected) == 0:
+
+                entry = _parse_metadata_group(item)
+                if entry is None:
                     dropped += 1
+                    dropped_reasons["invalid_group"] += 1
                     continue
-                text = item.get("target_text") or ""
-                if not text:
+                if entry["group_count"] < self.min_group_count:
                     dropped += 1
+                    dropped_reasons["too_small"] += 1
                     continue
-                text, emo_control_vector = parse_text_emotion_tags(text)
-                if not text:
-                    dropped += 1
-                    continue
-                self.entries.append({
-                    "target_text": text,
-                    "emo_control_vector": emo_control_vector,
-                    "voice_id": item["voice_id"],
-                    "chosen_files": [c["file"] for c in chosen if "file" in c],
-                    "rejected_files": [r["file"] for r in rejected if "file" in r],
-                })
+
+                self.entries.append(entry)
                 kept += 1
-        print(f"[Dataset] Loaded {kept} valid groups (dropped {dropped}).")
+        print(
+            f"[Dataset] Loaded {kept} valid groups (dropped {dropped}, "
+            f"min_group_count={self.min_group_count})."
+        )
+        if dropped:
+            print(
+                f"[Dataset] Drop reasons: parse_error={dropped_reasons['parse_error']}, "
+                f"invalid_group={dropped_reasons['invalid_group']}, "
+                f"too_small={dropped_reasons['too_small']}"
+            )
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -465,6 +692,7 @@ class MultigenGRPODataset(Dataset):
         text = entry["target_text"]
         voice_id = entry["voice_id"]
         emo_control_vector = entry["emo_control_vector"]
+        ref_stem = entry.get("ref_audio_stem", voice_id)
 
         # Tokenise text up-front (cheap) and length-filter.
         try:
@@ -475,19 +703,29 @@ class MultigenGRPODataset(Dataset):
         if len(text_ids) == 0 or len(text_ids) > self.max_text_tokens:
             return None
 
-        # Load reference audio.
-        ref_path = self.ref_audio_root / f"{voice_id}{self.ref_audio_suffix}"
-        ref_wav = _read_audio_to_16k(str(ref_path), max_seconds=self.max_ref_duration)
+        # Load reference audio.  Drop the whole group if the ref is longer than
+        # `max_ref_duration`; never truncate (same reasoning as for candidates:
+        # the frozen conditioning encoder produces a different speaker summary
+        # from truncated vs. full audio, which would silently mismatch
+        # inference and corrupt the policy/ref logp ratio).
+        ref_path = self.ref_audio_root / f"{ref_stem}{self.ref_audio_suffix}"
+        ref_wav = _read_audio_to_16k(
+            str(ref_path), max_seconds=self.max_ref_duration, truncate=False
+        )
         if ref_wav is None or ref_wav.numel() < int(self.min_audio_duration * TARGET_SR):
-            # Reference audio not available; group has to be skipped.
+            # Ref audio missing / unreadable / too long: skip the whole group.
             return None
 
-        # Sample candidates.
+        # Sample candidates.  Never truncate: candidate audios that exceed
+        # ``max_audio_duration`` are dropped because text<->audio alignment
+        # would be broken otherwise.
         picks = self._sample_candidates(entry["chosen_files"], entry["rejected_files"])
         candidates: List[GroupSample] = []
         for rel_path, reward in picks:
             full_path = self.audio_root / rel_path
-            wav = _read_audio_to_16k(str(full_path), max_seconds=self.max_audio_duration)
+            wav = _read_audio_to_16k(
+                str(full_path), max_seconds=self.max_audio_duration, truncate=False
+            )
             if wav is None:
                 continue
             if wav.numel() < int(self.min_audio_duration * TARGET_SR):
@@ -505,6 +743,7 @@ class MultigenGRPODataset(Dataset):
             candidates=candidates,
             group_key=f"{voice_id}::{idx}",
             emo_control_vector=emo_control_vector,
+            ref_audio_stem=ref_stem,
         )
 
 
@@ -561,13 +800,56 @@ def _load_gpt_checkpoint(model: UnifiedVoice, checkpoint_path: Path, verbose: bo
             print(f"[Warn] Unexpected keys: {unexpected}")
 
 
-def build_unified_voice(cfg_path: Path, tokenizer: TextTokenizer, checkpoint_path: Path) -> UnifiedVoice:
+def _disable_dropout(model: nn.Module) -> int:
+    """Set every ``nn.Dropout`` (and Dropout1d/2d/3d) module's probability to 0.
+
+    Critical for GRPO: with GPT-2 default ``attn_pdrop=resid_pdrop=embd_pdrop=0.1``,
+    the policy model (in train mode) would produce stochastic log-probabilities
+    while the reference (frozen, in eval mode) is deterministic.  This makes the
+    importance-sampling ratio ``exp(logp_pi - logp_ref)`` fluctuate randomly
+    around 1.0 from step 0 (KL ~ 0.08 measured empirically), defeating the PPO
+    clip and KL penalty.  Returns the number of dropout modules zeroed.
+    """
+    n = 0
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)):
+            m.p = 0.0
+            n += 1
+    return n
+
+
+def build_unified_voice(
+    cfg_path: Path,
+    tokenizer: TextTokenizer,
+    checkpoint_path: Path,
+    gradient_checkpointing: bool = False,
+) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
     if cfg.gpt.number_text_tokens != vocab_size:
         cfg.gpt.number_text_tokens = vocab_size
-    model = UnifiedVoice(**cfg.gpt, checkpointing=False)
+    # Note: we pass ``checkpointing`` through to ``UnifiedVoice`` so the
+    # underlying ``GPT2Config`` is built with ``gradient_checkpointing`` +
+    # ``use_cache=False`` from the start, then re-enable via the modern
+    # ``gradient_checkpointing_enable`` API to force ``use_reentrant=False``.
+    # Reentrant checkpointing requires at least one input tensor to have
+    # ``requires_grad=True``, but our GPT inputs are pre-computed embeddings
+    # (conditioning under ``no_grad`` + frozen text/mel embeddings) so the
+    # reentrant path would silently break the backward graph.
+    model = UnifiedVoice(**cfg.gpt, checkpointing=gradient_checkpointing)
     _load_gpt_checkpoint(model, checkpoint_path)
+    n_drop = _disable_dropout(model)
+    print(f"[Init] Disabled {n_drop} nn.Dropout module(s) for deterministic policy/ref logp.")
+    if gradient_checkpointing:
+        try:
+            model.gpt.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            # Older transformers without ``gradient_checkpointing_kwargs`` arg.
+            model.gpt.gradient_checkpointing_enable()
+        model.gpt.config.use_cache = False
+        print("[Init] Gradient checkpointing enabled on GPT (use_reentrant=False).")
     return model
 
 
@@ -576,19 +858,91 @@ def freeze_module(module: nn.Module):
         p.requires_grad = False
 
 
-def freeze_unified_voice_non_lm(model: UnifiedVoice):
-    """Freeze the same modules as the SFT script (everything outside the LM core)."""
-    for module in [
-        model.conditioning_encoder,
-        model.perceiver_encoder,
-        model.emo_conditioning_encoder,
-        model.emo_perceiver_encoder,
-        model.emo_layer,
-        model.emovec_layer,
-        model.speed_emb,
-        model.text_head,
-    ]:
-        freeze_module(module)
+def _set_module_trainable(module: nn.Module, trainable: bool):
+    for p in module.parameters():
+        p.requires_grad = trainable
+
+
+_ALWAYS_FROZEN_MODULES = (
+    "conditioning_encoder",
+    "perceiver_encoder",
+    "emo_conditioning_encoder",
+    "emo_perceiver_encoder",
+    "emo_layer",
+    "emovec_layer",
+    "speed_emb",
+    "text_head",
+)
+
+
+def configure_policy_trainable(
+    model: UnifiedVoice,
+    train_scope: str = "body_and_head",
+    gpt_train_mode: str = "full",
+) -> Dict[str, int]:
+    """Configure which UnifiedVoice weights receive gradients.
+
+    Returns a summary dict with trainable / total parameter counts.
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+
+    for name in _ALWAYS_FROZEN_MODULES:
+        sub = getattr(model, name, None)
+        if sub is not None:
+            freeze_module(sub)
+
+    trainable_entries: List[str] = []
+
+    if train_scope == "lm_core":
+        for name in ("text_embedding", "text_pos_embedding", "mel_embedding", "mel_pos_embedding"):
+            sub = getattr(model, name, None)
+            if sub is not None:
+                _set_module_trainable(sub, True)
+                trainable_entries.append(name)
+    else:
+        for name in ("text_embedding", "text_pos_embedding", "mel_embedding", "mel_pos_embedding"):
+            freeze_module(getattr(model, name))
+
+    _set_module_trainable(model.final_norm, True)
+    trainable_entries.append("final_norm")
+
+    if train_scope in ("body_and_head", "lm_core"):
+        _set_module_trainable(model.mel_head, True)
+        trainable_entries.append("mel_head")
+    else:
+        freeze_module(model.mel_head)
+
+    if gpt_train_mode == "full":
+        _set_module_trainable(model.gpt, True)
+        trainable_entries.append("gpt (full)")
+    elif gpt_train_mode == "attention_only":
+        freeze_module(model.gpt)
+        for block in model.gpt.h:
+            _set_module_trainable(block.attn, True)
+        trainable_entries.append("gpt.h.*.attn")
+    else:
+        raise ValueError(f"Unsupported gpt_train_mode: {gpt_train_mode}")
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return {
+        "trainable": trainable,
+        "total": total,
+        "train_scope": train_scope,
+        "gpt_train_mode": gpt_train_mode,
+        "modules": trainable_entries,
+    }
+
+
+def log_trainable_summary(model: UnifiedVoice, summary: Dict[str, int], prefix: str = ""):
+    pct = 100.0 * summary["trainable"] / max(summary["total"], 1)
+    print(
+        f"{prefix}[Trainable] scope={summary['train_scope']} "
+        f"gpt_mode={summary['gpt_train_mode']} | "
+        f"{summary['trainable']:,} / {summary['total']:,} params ({pct:.2f}%)"
+    )
+    print(f"{prefix}[Trainable] modules: {', '.join(summary['modules'])}")
 
 
 def find_most_similar_cosine(query_vector: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
@@ -658,68 +1012,74 @@ class FeaturePreprocessor(nn.Module):
 
     @torch.no_grad()
     def get_spk_emb(self, input_features: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        vq_emb = self.semantic_model(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        feat = vq_emb.hidden_states[17]
-        feat = (feat - self.semantic_mean) / self.semantic_std
-        return feat
+        # Force fp32: semantic_model (w2v-bert) is loaded in fp32 and is sensitive
+        # to mixed precision (its conv front-end overflows in fp16 for some inputs).
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            vq_emb = self.semantic_model(
+                input_features=input_features.float(),
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            feat = vq_emb.hidden_states[17].float()
+            feat = (feat - self.semantic_mean) / self.semantic_std
+            return feat
 
     @torch.no_grad()
     def extract_spk_cond_emb(self, wavs_16k: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (spk_cond_emb [B, T, 1024], cond_lengths [B])."""
-        wavs_on_dev = [w.to(self.device, non_blocking=True).float() for w in wavs_16k]
-        inputs = self.gpu_feature_extractor(wavs_on_dev)
-        spk_cond_emb = self.get_spk_emb(inputs["input_features"], inputs["attention_mask"])
-        cond_lengths = inputs["attention_mask"].sum(dim=1).long()
-        return spk_cond_emb, cond_lengths
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            wavs_on_dev = [w.to(self.device, non_blocking=True).float() for w in wavs_16k]
+            inputs = self.gpu_feature_extractor(wavs_on_dev)
+            spk_cond_emb = self.get_spk_emb(inputs["input_features"], inputs["attention_mask"])
+            cond_lengths = inputs["attention_mask"].sum(dim=1).long()
+            return spk_cond_emb, cond_lengths
 
     @torch.no_grad()
     def extract_codes(self, wavs_16k: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (codes [B, T_max], code_lengths [B])."""
-        spk_cond_emb, code_lengths = self.extract_spk_cond_emb(wavs_16k)
-        codes, _ = self.semantic_codec.quantize(spk_cond_emb)  # [B, T_max]
-        # Mask out positions past the valid length with stop_mel_token-equivalent zeros;
-        # the loss will mask these via code_lengths.
-        return codes.long(), code_lengths
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            spk_cond_emb, code_lengths = self.extract_spk_cond_emb(wavs_16k)
+            # semantic_codec.quantize uses dist/argmin -> keep in fp32.
+            codes, _ = self.semantic_codec.quantize(spk_cond_emb.float())
+            return codes.long(), code_lengths
 
     @torch.no_grad()
     def extract_styles(self, wavs_16k: List[torch.Tensor]) -> torch.Tensor:
         """Return CAM++ style embeddings [B, 192] for reference audios."""
-        styles = []
-        for wav in wavs_16k:
-            audio = wav.to(self.device, non_blocking=True).float().unsqueeze(0)
-            feat = torchaudio.compliance.kaldi.fbank(
-                audio,
-                num_mel_bins=80,
-                dither=0,
-                sample_frequency=TARGET_SR,
-            )
-            feat = feat - feat.mean(dim=0, keepdim=True)
-            style = self.campplus_model(feat.unsqueeze(0).to(device=self.device, dtype=self.dtype))
-            styles.append(style)
-        return torch.cat(styles, dim=0)
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            styles = []
+            for wav in wavs_16k:
+                audio = wav.to(self.device, non_blocking=True).float().unsqueeze(0)
+                feat = torchaudio.compliance.kaldi.fbank(
+                    audio,
+                    num_mel_bins=80,
+                    dither=0,
+                    sample_frequency=TARGET_SR,
+                )
+                feat = feat - feat.mean(dim=0, keepdim=True)
+                style = self.campplus_model(feat.unsqueeze(0).to(device=self.device, dtype=self.dtype))
+                styles.append(style)
+            return torch.cat(styles, dim=0)
 
     @torch.no_grad()
     def build_label_emovec(self, styles: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         """Match inference's feat1/feat2 emotion-vector lookup and weighted sum."""
-        out = []
-        for style, weight_vector in zip(styles, weights):
-            random_index = [
-                find_most_similar_cosine(style.unsqueeze(0), matrix)
-                for matrix in self.spk_matrix
-            ]
-            emo_matrix = [
-                matrix[index].unsqueeze(0)
-                for index, matrix in zip(random_index, self.emo_matrix)
-            ]
-            emo_matrix = torch.cat(emo_matrix, dim=0).to(device=self.device, dtype=self.dtype)
-            weight_vector = weight_vector.to(device=self.device, dtype=self.dtype)
-            emovec_mat = torch.sum(weight_vector.unsqueeze(1) * emo_matrix, dim=0)
-            out.append(emovec_mat.unsqueeze(0))
-        return torch.cat(out, dim=0)
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            out = []
+            for style, weight_vector in zip(styles, weights):
+                random_index = [
+                    find_most_similar_cosine(style.unsqueeze(0), matrix)
+                    for matrix in self.spk_matrix
+                ]
+                emo_matrix = [
+                    matrix[index].unsqueeze(0)
+                    for index, matrix in zip(random_index, self.emo_matrix)
+                ]
+                emo_matrix = torch.cat(emo_matrix, dim=0).to(device=self.device, dtype=self.dtype)
+                weight_vector = weight_vector.to(device=self.device, dtype=self.dtype)
+                emovec_mat = torch.sum(weight_vector.unsqueeze(1) * emo_matrix, dim=0)
+                out.append(emovec_mat.unsqueeze(0))
+            return torch.cat(out, dim=0)
 
 
 # =============================================================================
@@ -750,6 +1110,16 @@ def gpt_per_token_logp(
     target_device = text_ids.device
     batch_size = text_ids.size(0)
     use_speed = torch.zeros(batch_size, dtype=torch.long, device=target_device)
+
+    # Make sure the float conditioning tensors match the model's parameter
+    # dtype (relevant when the reference GPT is stored in fp16 / bf16 to save
+    # memory).  Otherwise the cat below would mix fp32 conditioning with the
+    # fp16 embedding output and raise a dtype mismatch.
+    param_dtype = next(model.parameters()).dtype
+    if conditioning.dtype != param_dtype:
+        conditioning = conditioning.to(param_dtype)
+    if emo_vec.dtype != param_dtype:
+        emo_vec = emo_vec.to(param_dtype)
 
     text_inputs = model.set_text_padding(text_ids.clone(), text_lengths)
     text_inputs = F.pad(text_inputs, (0, 1), value=model.stop_text_token)
@@ -784,8 +1154,10 @@ def gpt_per_token_logp(
 
     _, mel_logits = model.get_logits(conds, text_emb, model.text_head,
                                      mel_emb, model.mel_head)
-    # mel_logits: [B, V, T]
-    log_probs = F.log_softmax(mel_logits, dim=1)
+    # mel_logits: [B, V, T] -- promote to fp32 for log_softmax stability with
+    # an 8194-class output; fp16 log_softmax over wide vocabs has poor tail
+    # precision (matters for the KL/ratio terms).
+    log_probs = F.log_softmax(mel_logits.float(), dim=1)
     per_token_logp = log_probs.gather(1, mel_targets.unsqueeze(1)).squeeze(1)  # [B, T]
 
     mel_mask = (
@@ -803,6 +1175,91 @@ def gpt_per_token_logp(
 
 
 # =============================================================================
+# Per-reference-audio feature cache
+# =============================================================================
+
+class RefFeatureCache:
+    """In-memory cache for the per-reference-audio features that feed the GPT.
+
+    All three cached tensors are *pure deterministic functions* of the ref
+    audio plus the (frozen) sub-modules
+    ``policy_model.conditioning_encoder / perceiver_encoder /
+    emo_conditioning_encoder / emo_perceiver_encoder / emovec_layer / emo_layer``
+    and ``feature_extractor.campplus_model``.  None of those weights change
+    during GRPO, so cache entries are valid for the full training run.
+
+    Each entry stores (per ref audio stem):
+      * ``conditioning``  : [cond_num, model_dim]  (e.g. [32, 1280])
+      * ``emo_vec_base``  : [model_dim]            (output of ``get_emovec``)
+      * ``style``         : [192]                  (CAM++ output, used only by
+                                                    the text-emo control branch)
+
+    Storage is fp32 on CPU, ~166 KB / ref for model_dim=1280, ~376 MB for the
+    full multigen metadata (~2.3k unique voice ids).  Each DDP rank keeps its
+    own cache; no cross-process synchronisation is required.
+
+    The cache deliberately stores the *base* emo vec (before mixing with the
+    text-side emo control vector), since the mixing weights depend on the
+    text and must therefore be recomputed every step.
+    """
+
+    def __init__(self, max_entries: Optional[int] = None):
+        self._cond: Dict[str, torch.Tensor] = {}
+        self._emo: Dict[str, torch.Tensor] = {}
+        self._style: Dict[str, torch.Tensor] = {}
+        self._max_entries = max_entries
+        self.hits = 0
+        self.misses = 0
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._cond
+
+    def __len__(self) -> int:
+        return len(self._cond)
+
+    def get(self, key: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._cond[key], self._emo[key], self._style[key]
+
+    def put(
+        self,
+        key: str,
+        conditioning: torch.Tensor,
+        emo_vec: torch.Tensor,
+        style: torch.Tensor,
+    ) -> None:
+        if self._max_entries is not None and len(self._cond) >= self._max_entries and key not in self._cond:
+            # Simple FIFO eviction; this codebase only ever fills a few thousand
+            # entries so we never expect to hit this in practice.
+            evict_key = next(iter(self._cond))
+            self._cond.pop(evict_key, None)
+            self._emo.pop(evict_key, None)
+            self._style.pop(evict_key, None)
+        self._cond[key] = conditioning.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        self._emo[key] = emo_vec.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        self._style[key] = style.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+    def memory_bytes(self) -> int:
+        if not self._cond:
+            return 0
+        sample_key = next(iter(self._cond))
+        per_ref = (
+            self._cond[sample_key].numel()
+            + self._emo[sample_key].numel()
+            + self._style[sample_key].numel()
+        ) * 4  # fp32
+        return per_ref * len(self._cond)
+
+    def stats_str(self) -> str:
+        total = self.hits + self.misses
+        rate = (self.hits / total * 100.0) if total > 0 else 0.0
+        return (
+            f"entries={len(self)} hit_rate={rate:.1f}% "
+            f"(hits={self.hits} misses={self.misses}) "
+            f"mem={self.memory_bytes() / (1024 * 1024):.1f}MB"
+        )
+
+
+# =============================================================================
 # Batch preparation (groups -> flattened tensors ready for forward)
 # =============================================================================
 
@@ -812,10 +1269,16 @@ def prepare_grpo_batch(
     policy_model: UnifiedVoice,
     device: torch.device,
     max_samples_per_batch: int,
+    ref_cache: Optional[RefFeatureCache] = None,
 ) -> Optional[Dict[str, Any]]:
     """Turn a list of GroupItems into ready-to-train tensors.
 
     Returns ``None`` if the resulting batch is empty.
+
+    When ``ref_cache`` is provided, per-reference-audio features
+    (``conditioning``, ``emo_vec_base``, ``style``) are looked up by
+    ``GroupItem.ref_audio_stem``; misses run the full feature pipeline on
+    just the missing subset and are then written back to the cache.
     """
     if not groups:
         return None
@@ -851,6 +1314,7 @@ def prepare_grpo_batch(
                     candidates=picks,
                     group_key=g.group_key,
                     emo_control_vector=g.emo_control_vector,
+                    ref_audio_stem=g.ref_audio_stem,
                 ))
                 budget -= len(picks)
         groups = kept_groups
@@ -873,16 +1337,61 @@ def prepare_grpo_batch(
     #    which acts as "no masking" since T<<1024.  We pass the actual frame count from
     #    the GPU feature extractor's attention_mask, which is strictly more correct
     #    and equivalent when each batch item's audio is processed alone.
-    ref_wavs = [g.ref_wav_16k for g in groups]
-    spk_cond_emb_ref, cond_len_ref = feature_extractor.extract_spk_cond_emb(ref_wavs)
+    # All preprocessing (FE + frozen conditioning / emo encoders) is forced to
+    # fp32; both because the conv front-end of w2v-bert overflows in fp16 and
+    # because we want the conditioning to be reproducible bit-for-bit between
+    # the policy and reference forwards.
+    # Split groups by cache hit/miss.  A group is a miss if no cache was
+    # provided, the group has no ref_audio_stem, or its stem is not in cache.
+    G = len(groups)
+    cond_slots: List[Optional[torch.Tensor]] = [None] * G
+    emo_base_slots: List[Optional[torch.Tensor]] = [None] * G
+    style_slots: List[Optional[torch.Tensor]] = [None] * G
+    miss_idx: List[int] = []
+    for i, g in enumerate(groups):
+        key = g.ref_audio_stem
+        if ref_cache is not None and key is not None and key in ref_cache:
+            cond_c, emo_c, style_c = ref_cache.get(key)
+            cond_slots[i] = cond_c
+            emo_base_slots[i] = emo_c
+            style_slots[i] = style_c
+            ref_cache.hits += 1
+        else:
+            miss_idx.append(i)
+            if ref_cache is not None:
+                ref_cache.misses += 1
 
-    with torch.no_grad():
-        feat_t = spk_cond_emb_ref.transpose(1, 2)  # (G, 1024, T)
-        cond_per_group = policy_model.get_conditioning(feat_t, cond_len_ref)  # [G, 32, d]
+    with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
+        # Run the full feature pipeline only on the cache misses.
+        if miss_idx:
+            miss_ref_wavs = [groups[i].ref_wav_16k for i in miss_idx]
+            spk_cond_emb_ref, cond_len_ref = feature_extractor.extract_spk_cond_emb(miss_ref_wavs)
+            feat_t = spk_cond_emb_ref.transpose(1, 2)  # (G_miss, 1024, T)
+            cond_miss = policy_model.get_conditioning(feat_t, cond_len_ref)  # [G_miss, 32, d]
+            # Base emo vec from the same reference audio.  Mirrors inference
+            # ``gpt.merge_emovec(..., emo_audio == spk_audio, alpha=1.0)``.
+            emo_base_miss = policy_model.get_emovec(spk_cond_emb_ref, cond_len_ref)  # [G_miss, d]
+            # Always compute CAM++ style on a miss so the cache stays uniform,
+            # even if the current batch has no text-emo control vector.
+            style_miss = feature_extractor.extract_styles(miss_ref_wavs)  # [G_miss, 192]
 
-        # Base emo vec from the same reference audio.  This mirrors inference
-        # `gpt.merge_emovec(..., emo_audio == spk_audio, alpha=1.0)`.
-        emo_vec_per_group = policy_model.get_emovec(spk_cond_emb_ref, cond_len_ref)  # [G, d]
+            for j, i in enumerate(miss_idx):
+                cond_slots[i] = cond_miss[j]
+                emo_base_slots[i] = emo_base_miss[j]
+                style_slots[i] = style_miss[j]
+                key = groups[i].ref_audio_stem
+                if ref_cache is not None and key is not None:
+                    ref_cache.put(key, cond_miss[j], emo_base_miss[j], style_miss[j])
+
+        # Stack into per-group tensors.  Each slot was either fetched from
+        # the (CPU fp32) cache or just computed on-device; ``.to(device)``
+        # is a no-op for the latter.
+        cond_per_group = torch.stack(
+            [t.to(device=device, dtype=torch.float32) for t in cond_slots], dim=0
+        )  # [G, 32, d]
+        emo_vec_per_group = torch.stack(
+            [t.to(device=device, dtype=torch.float32) for t in emo_base_slots], dim=0
+        )  # [G, d]
 
         if any(g.emo_control_vector is not None for g in groups):
             # Text labels like [Sadness:2;Surprise:5] are mixed the same way as
@@ -891,17 +1400,19 @@ def prepare_grpo_batch(
                 g.emo_control_vector if g.emo_control_vector is not None
                 else torch.zeros(len(EMOTION_ORDER), dtype=torch.float32)
                 for g in groups
-            ]).to(device=spk_cond_emb_ref.device, dtype=spk_cond_emb_ref.dtype)
-            styles = feature_extractor.extract_styles(ref_wavs)
+            ]).to(device=device, dtype=cond_per_group.dtype)
+            styles = torch.stack(
+                [t.to(device=device, dtype=torch.float32) for t in style_slots], dim=0
+            )  # [G, 192]
             label_emovec = feature_extractor.build_label_emovec(styles, emo_controls)
             residual_scale = 1.0 - emo_controls.sum(dim=1, keepdim=True)
             emo_vec_per_group = label_emovec + residual_scale * emo_vec_per_group
 
-    # 2) Candidate audio -> semantic codes (the y_i token sequence).
-    cand_wavs: List[torch.Tensor] = []
-    for g in groups:
-        cand_wavs.extend([c.wav_16k for c in g.candidates])
-    codes_padded, code_lens = feature_extractor.extract_codes(cand_wavs)
+        # 2) Candidate audio -> semantic codes (the y_i token sequence).
+        cand_wavs: List[torch.Tensor] = []
+        for g in groups:
+            cand_wavs.extend([c.wav_16k for c in g.candidates])
+        codes_padded, code_lens = feature_extractor.extract_codes(cand_wavs)
 
     # 3) Per-sample text / conditioning / emo / reward / group index.
     text_ids_list: List[torch.Tensor] = []
@@ -942,41 +1453,54 @@ def prepare_grpo_batch(
 # =============================================================================
 
 def compute_advantages(rewards: torch.Tensor, group_index: torch.Tensor, num_groups: int,
-                       norm_strategy: str, eps: float = 1e-8) -> torch.Tensor:
-    """Compute per-sample advantages.
+                       norm_strategy: str, eps: float = 1e-8
+                       ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-sample advantages and a per-sample validity mask.
+
+    Returns ``(advantages, valid_mask)`` where ``valid_mask[i] == True`` means
+    candidate ``i`` should contribute to the policy / KL loss.  A candidate is
+    invalid iff its group has fewer than 2 samples or all rewards in the group
+    are identical (zero variance).
 
     ``norm_strategy``:
-      - ``intra_group``: (R - mean_g) / (std_g + eps), filtered when std_g == 0.
-      - ``global_batch``: do the intra-group centring first, then standardise across
-        the whole batch (recommended for small / variable G; see arXiv:2511.21270).
+      - ``intra_group``: (R - mean_g) / (std_g + eps).
+      - ``global_batch``: intra-group centring first, then standardise across
+        the whole batch over the *valid* samples (see arXiv:2511.21270).
+
+    The validity is decided strictly from ``group_index`` + ``rewards``, not
+    from the numerical value of the centred advantage.  This avoids a subtle
+    bug where a candidate whose reward equals its group mean (centred=0) used
+    to be silently dropped as if it belonged to a degenerate group.
     """
     advantages = torch.zeros_like(rewards)
+    valid_mask = torch.zeros_like(rewards, dtype=torch.bool)
+
     for g in range(num_groups):
         mask = (group_index == g)
         if mask.sum() < 2:
             continue
         r_g = rewards[mask]
+        std_g = r_g.std(unbiased=False)
+        if std_g.item() < 1e-6:
+            continue
         mean_g = r_g.mean()
         if norm_strategy == "intra_group":
-            std_g = r_g.std(unbiased=False)
-            if std_g.item() < 1e-6:
-                continue
             advantages[mask] = (r_g - mean_g) / (std_g + eps)
-        else:  # global_batch -> only centre per group here
+        else:
             advantages[mask] = r_g - mean_g
+        valid_mask[mask] = True
 
     if norm_strategy == "global_batch":
-        # Drop samples whose group had zero variance (centred = 0 everywhere in that
-        # group), then standardise the rest across the batch.
-        nonzero = advantages.abs() > 0
-        if nonzero.sum() >= 2:
-            sub = advantages[nonzero]
+        if valid_mask.sum().item() >= 2:
+            sub = advantages[valid_mask]
             advantages = (advantages - sub.mean()) / (sub.std(unbiased=False) + eps)
-            # zero-out the dropped groups again
-            advantages = advantages * nonzero.float()
+            # Re-zero anything outside the valid mask (the centring above pushed
+            # invalid samples away from 0).
+            advantages = advantages * valid_mask.to(advantages.dtype)
         else:
             advantages = torch.zeros_like(advantages)
-    return advantages
+
+    return advantages, valid_mask
 
 
 def compute_grpo_loss(
@@ -989,8 +1513,15 @@ def compute_grpo_loss(
     kl_estimator: str = "k3",
     entropy: Optional[torch.Tensor] = None,
     entropy_coeff: float = 0.0,
+    sample_valid: Optional[torch.Tensor] = None,  # [B] bool/float, explicit per-sample mask
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Mean-over-tokens, mean-over-samples GRPO loss with PPO-style clipping."""
+    """Mean-over-tokens, mean-over-samples GRPO loss with PPO-style clipping.
+
+    ``sample_valid`` is the authoritative per-sample mask (1 = include in the
+    loss, 0 = skip).  It should come from ``compute_advantages`` and reflects
+    group-level validity, not the numerical value of ``advantages``.  When not
+    provided, falls back to the legacy ``advantages.abs() > 0`` heuristic.
+    """
     valid_token_counts = mask.sum(dim=1).clamp_min(1.0)  # [B]
 
     diff = logp_policy - logp_ref  # [B, T]
@@ -1011,7 +1542,9 @@ def compute_grpo_loss(
     pg_per_sample = (pg_token * mask).sum(dim=1) / valid_token_counts
     kl_per_sample = (kl_token * mask).sum(dim=1) / valid_token_counts
 
-    valid_samples = (advantages.abs() > 0).float()  # ignore filtered groups
+    if sample_valid is None:
+        sample_valid = (advantages.abs() > 0)
+    valid_samples = sample_valid.to(pg_per_sample.dtype)
     n_valid = valid_samples.sum().clamp_min(1.0)
 
     policy_loss = (pg_per_sample * valid_samples).sum() / n_valid
@@ -1023,7 +1556,7 @@ def compute_grpo_loss(
         "policy_loss": policy_loss.detach(),
         "kl": kl_loss.detach(),
         "ratio_mean": ((ratio * mask).sum() / mask.sum().clamp_min(1)).detach(),
-        "valid_samples": n_valid.detach(),
+        "valid_samples": valid_samples.sum().detach(),
     }
 
     if entropy is not None and entropy_coeff > 0:
@@ -1040,16 +1573,15 @@ def compute_grpo_loss(
 # GRPO loss wrapper (so Accelerate can wrap it like the SFT version)
 # =============================================================================
 
-_POLICY_FROZEN_SUBMODULES = (
-    "conditioning_encoder",
-    "perceiver_encoder",
-    "emo_conditioning_encoder",
-    "emo_perceiver_encoder",
-    "emo_layer",
-    "emovec_layer",
-    "speed_emb",
-    "text_head",
-)
+_POLICY_FROZEN_SUBMODULES = _ALWAYS_FROZEN_MODULES
+
+
+def _pin_frozen_submodules_eval(model: nn.Module):
+    """Keep every fully-frozen submodule in eval mode (LayerNorm / Dropout)."""
+    for module in model.modules():
+        params = list(module.parameters(recurse=False))
+        if params and all(not p.requires_grad for p in params):
+            module.eval()
 
 
 class GRPOLossWrapper(nn.Module):
@@ -1090,12 +1622,9 @@ class GRPOLossWrapper(nn.Module):
         self.duration_dropout = duration_dropout
 
     def _pin_eval_submodules(self):
-        """Force ref_model and the frozen policy submodules into eval mode."""
+        """Force ref_model and fully-frozen policy submodules into eval mode."""
         self.ref_model.eval()
-        for name in _POLICY_FROZEN_SUBMODULES:
-            sub = getattr(self.policy_model, name, None)
-            if sub is not None:
-                sub.eval()
+        _pin_frozen_submodules_eval(self.policy_model)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -1107,7 +1636,8 @@ class GRPOLossWrapper(nn.Module):
         self._pin_eval_submodules()
         return self
 
-    def forward(self, batch: Dict[str, Any], advantages: torch.Tensor):
+    def forward(self, batch: Dict[str, Any], advantages: torch.Tensor,
+                sample_valid: Optional[torch.Tensor] = None):
         text_ids = batch["text_ids"]
         text_lengths = batch["text_lengths"]
         codes = batch["codes"]
@@ -1162,6 +1692,7 @@ class GRPOLossWrapper(nn.Module):
             kl_estimator=self.kl_estimator,
             entropy=entropy,
             entropy_coeff=self.entropy_coeff,
+            sample_valid=sample_valid,
         )
         return loss, metrics
 
@@ -1242,10 +1773,19 @@ def main() -> None:
     tokenizer = load_tokenizer(args.tokenizer)
 
     accelerator.print("[Init] Building policy GPT ...")
-    policy_model = build_unified_voice(args.config, tokenizer, args.base_checkpoint)
-    for p in policy_model.parameters():
-        p.requires_grad = True
-    freeze_unified_voice_non_lm(policy_model)
+    policy_model = build_unified_voice(
+        args.config,
+        tokenizer,
+        args.base_checkpoint,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+    trainable_summary = configure_policy_trainable(
+        policy_model,
+        train_scope=args.train_scope,
+        gpt_train_mode=args.gpt_train_mode,
+    )
+    if accelerator.is_main_process:
+        log_trainable_summary(policy_model, trainable_summary, prefix="[Policy] ")
 
     accelerator.print("[Init] Building reference GPT ...")
     ref_ckpt = args.ref_checkpoint or args.base_checkpoint
@@ -1253,6 +1793,12 @@ def main() -> None:
     for p in ref_model.parameters():
         p.requires_grad = False
     ref_model.eval()
+
+    ref_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.ref_dtype]
+    if ref_dtype != torch.float32:
+        ref_model.to(dtype=ref_dtype)
+        if accelerator.is_main_process:
+            print(f"[Init] Reference GPT cast to {args.ref_dtype} (saves ~{50 if args.ref_dtype != 'fp32' else 0}% memory).")
 
     # --- Feature extractor (on accelerator's device, no DDP wrapping) -------
     cfg = OmegaConf.load(args.config)
@@ -1274,6 +1820,7 @@ def main() -> None:
         ref_audio_suffix=args.ref_audio_suffix,
         reward_chosen=args.reward_chosen,
         reward_rejected=args.reward_rejected,
+        min_group_count=args.min_group_count,
     )
 
     loader = DataLoader(
@@ -1285,6 +1832,18 @@ def main() -> None:
         pin_memory=False,  # variable-length tensors per item -> manual transfer
         drop_last=True,
     )
+
+    # --- Ref-audio feature cache -------------------------------------------
+    if args.no_ref_cache:
+        ref_cache: Optional[RefFeatureCache] = None
+        if accelerator.is_main_process:
+            print("[RefCache] Disabled via --no-ref-cache.")
+    else:
+        max_entries = args.ref_cache_max_entries if args.ref_cache_max_entries > 0 else None
+        ref_cache = RefFeatureCache(max_entries=max_entries)
+        if accelerator.is_main_process:
+            cap = "unbounded" if max_entries is None else f"<= {max_entries}"
+            print(f"[RefCache] Enabled (CPU fp32, {cap}).")
 
     # --- Wrapper / Optimiser ------------------------------------------------
     wrapper = GRPOLossWrapper(
@@ -1378,18 +1937,20 @@ def main() -> None:
                     policy_model=_unwrap_policy(),
                     device=accelerator.device,
                     max_samples_per_batch=args.max_samples_per_batch,
+                    ref_cache=ref_cache,
                 )
 
             if batch is not None and batch["rewards"].numel() > 0:
-                advantages = compute_advantages(
+                advantages, sample_valid = compute_advantages(
                     rewards=batch["rewards"],
                     group_index=batch["group_index"],
                     num_groups=batch["num_groups"],
                     norm_strategy=args.adv_norm,
                 )
-                local_valid = float((advantages.abs() > 0).any().item())
+                local_valid = float(sample_valid.any().item())
             else:
                 advantages = None
+                sample_valid = None
                 local_valid = 0.0
 
             # All processes must agree before doing a backward, otherwise DDP
@@ -1403,7 +1964,7 @@ def main() -> None:
 
             # ----- Forward + backward (under accumulate context) -----
             with accelerator.accumulate(wrapper):
-                loss, metrics = wrapper(batch, advantages)
+                loss, metrics = wrapper(batch, advantages, sample_valid=sample_valid)
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -1449,6 +2010,8 @@ def main() -> None:
                         f"n={int(metrics['valid_samples'].item())} "
                         f"lr={lr:.2e}"
                     )
+                    if ref_cache is not None and accelerator.is_main_process:
+                        accelerator.print(f"[RefCache] {ref_cache.stats_str()}")
 
                 is_regular_save = (global_step % args.save_every == 0)
                 is_major_save = (args.major_save_every > 0 and global_step % args.major_save_every == 0)

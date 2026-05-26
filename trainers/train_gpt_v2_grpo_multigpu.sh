@@ -7,19 +7,20 @@ accelerate launch \
     --mixed_precision fp16 \
     trainers/train_gpt_v2_grpo_multigpu.py \
     --config checkpoints/IndexTTS-2-vLLM/config.yaml \
-    --tokenizer checkpoints/IndexTTS-2-vLLM/jp_es_bpe.model \
+    --tokenizer checkpoints/IndexTTS-2-vLLM/bpe.model \
     --base-checkpoint checkpoints/IndexTTS-2-vLLM/gpt.pth \
     --model-dir checkpoints/IndexTTS-2-vLLM \
-    --metadata /mnt/data_3t_1/datasets/raw_data/noiz-v2/multigen/metadata_v2.jsonl \
+    --metadata /mnt/data_3t_1/datasets/raw_data/noiz-v2/multigen/metadata_v2_merged_04-05.jsonl \
     --audio-root /mnt/data_3t_1/datasets/raw_data/noiz-v2/multigen \
     --ref-audio-root /mnt/data_3t_1/datasets/raw_data/noiz-v2/ref_audios \
     --ref-audio-suffix .flac \
     --max-group-size 8 \
     --max-samples-per-batch 16 \
-    --max-audio-duration 20 \
-    --max-ref-duration 15 \
+    --max-audio-duration 36 \
+    --max-ref-duration 36 \
     --groups-per-device 1 \
     --grad-accumulation 1 \
+    --gradient-checkpointing \
     --num-workers 2 \
     --epochs 3 \
     --learning-rate 2e-6 \
