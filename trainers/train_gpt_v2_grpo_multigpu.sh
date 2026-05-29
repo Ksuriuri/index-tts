@@ -23,7 +23,7 @@ accelerate launch \
     --gradient-checkpointing \
     --num-workers 2 \
     --epochs 3 \
-    --learning-rate 2e-6 \
+    --learning-rate 1e-5 \
     --weight-decay 0.0 \
     --warmup-steps 50 \
     --clip-eps 0.2 \
@@ -37,6 +37,6 @@ accelerate launch \
     --keep-last 2 \
     --output-dir ./trained_ckpts/grpo \
     --wandb-project "IndexTTS2-GRPO" \
-    --wandb-run-name "noiz_v2_multigen_grpo"
+    --wandb-run-name "noiz_v2_multigen_grpo-0527"
     # --use-duration-control --duration-dropout 0.3 \
     # --resume auto \
