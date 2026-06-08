@@ -29,6 +29,12 @@ accelerate launch \
     --clip-eps 0.2 \
     --kl-coeff 0.04 \
     --kl-estimator k3 \
+    --adaptive-kl \
+    --akl-acc-ema 0.9 \
+    --akl-rho-min 0.5 \
+    --akl-rho-max 1.2 \
+    --akl-center 0.5 \
+    --akl-sharpness 6.0 \
     --adv-norm global_batch \
     --entropy-coeff 0.0 \
     --log-interval 10 \
@@ -37,6 +43,6 @@ accelerate launch \
     --keep-last 2 \
     --output-dir ./trained_ckpts/grpo \
     --wandb-project "IndexTTS2-GRPO" \
-    --wandb-run-name "noiz_v2_multigen_grpo-0527"
+    --wandb-run-name "noiz_v2_multigen_grpo-0531"
     # --use-duration-control --duration-dropout 0.3 \
     # --resume auto \

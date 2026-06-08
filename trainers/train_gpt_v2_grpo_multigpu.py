@@ -4,6 +4,7 @@ GRPO finetune for IndexTTS2 GPT.
 References:
 - https://arxiv.org/abs/2509.21718
 - https://arxiv.org/abs/2511.21270
+- https://arxiv.org/abs/2605.11403  (FG-ExPO: Accuracy-Conditioned KL Scaling, --adaptive-kl)
 
 Pipeline (on-the-fly, no offline preprocessing):
   metadata_v2.jsonl  ->  groups of (text, voice_id, [chosen audios], [rejected audios])
@@ -197,6 +198,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-rejected", type=float, default=0.0)
     parser.add_argument("--kl-estimator", type=str, default="k3", choices=["k1", "k3"],
                         help="KL approximation: k1=logp_ref - logp_pi, k3=exp(d) - d - 1, d=logp_ref-logp_pi.")
+    parser.add_argument("--adaptive-kl", action="store_true",
+                        help="Accuracy-Conditioned KL Scaling (AKL, arXiv:2605.11403): scale the KL "
+                             "coefficient by rho(acc)=(tanh(acc)+1)/2, where `acc` is the policy's "
+                             "batch pairwise preference accuracy (chosen ranked above rejected). "
+                             "Relaxes the KL anchor when the model is failing, tightens it when "
+                             "succeeding. beta_eff stays in [0.5, 0.881]*kl_coeff; GRPO is recovered "
+                             "when this flag is off.")
+    parser.add_argument("--akl-acc-ema", type=float, default=0.9,
+                        help="EMA smoothing factor for the batch accuracy used by --adaptive-kl "
+                             "(0 = raw per-batch accuracy, as in the paper; >0 stabilises the small "
+                             "per-step batches in this trainer). Only used when --adaptive-kl is set.")
+    parser.add_argument("--akl-rho-min", type=float, default=0.5,
+                        help="AKL: lower bound of the KL multiplier rho (applied when the model is "
+                             "failing -> more exploration). Paper ~0.5.")
+    parser.add_argument("--akl-rho-max", type=float, default=1.2,
+                        help="AKL: upper bound of the KL multiplier rho (applied when the model is "
+                             "succeeding -> tighter anchor). Paper ~0.881; >1 makes the effect more "
+                             "pronounced. beta_eff lives in [rho_min, rho_max]*kl_coeff.")
+    parser.add_argument("--akl-center", type=float, default=0.5,
+                        help="AKL: accuracy at which rho sits mid-band. Set near the policy's typical "
+                             "preference accuracy (see the logged train/akl_acc).")
+    parser.add_argument("--akl-sharpness", type=float, default=6.0,
+                        help="AKL: logistic temperature. Larger => rho reacts more sharply to small "
+                             "accuracy changes (paper's tanh is ~2, i.e. very gentle).")
 
     # Trainable-parameter scope
     parser.add_argument(
@@ -1503,6 +1528,86 @@ def compute_advantages(rewards: torch.Tensor, group_index: torch.Tensor, num_gro
     return advantages, valid_mask
 
 
+# =============================================================================
+# Accuracy-Conditioned KL Scaling (AKL)  --  arXiv:2605.11403 (FG-ExPO)
+# =============================================================================
+#
+# The paper replaces the fixed KL coefficient ``beta`` with a competence-coupled
+# coefficient ``beta_eff = beta * rho(acc)`` where ``acc`` is the batch mean
+# accuracy and ``rho`` is monotone increasing + two-sided bounded.  When the
+# model is failing the anchor is relaxed (more exploration); when it succeeds
+# the anchor is tightened (stability).  GRPO is recovered exactly when rho == 1.
+#
+# IMPORTANT adaptation to this trainer: rewards here are *offline* preference
+# labels (chosen=1 / rejected=0) and every group is built to contain both, so
+# ``rewards.mean()`` is a fixed data-sampling ratio, NOT model competence.  The
+# faithful competence signal is therefore the policy's pairwise preference
+# accuracy: the fraction of (chosen, rejected) pairs in a group for which the
+# current policy assigns a higher mean per-token log-prob to the chosen sample.
+
+def akl_rho(
+    acc: torch.Tensor,
+    rho_min: float = 0.5,
+    rho_max: float = 1.2,
+    center: float = 0.5,
+    sharpness: float = 6.0,
+) -> torch.Tensor:
+    """Nonlinear KL scaling ``rho(acc)`` -- a generalised, tunable version of the
+    paper's ``(tanh(x)+1)/2``.
+
+    ``rho(acc) = rho_min + (rho_max - rho_min) * sigmoid(sharpness * (acc - center))``
+
+    It stays monotone increasing and two-sided bounded by ``[rho_min, rho_max]``
+    (the paper's two required properties), but exposes the knobs that control how
+    *pronounced* the effect is:
+
+    - ``rho_min`` / ``rho_max``: the band of the effective KL multiplier.  A wider
+      band => a stronger swing between exploration (low acc) and stability (high
+      acc).  The paper uses ~``[0.5, 0.881]``.
+    - ``center``: the accuracy at which ``rho`` sits midway through its band; put
+      it near the policy's typical operating accuracy (watch ``train/akl_acc``).
+    - ``sharpness``: logistic temperature.  Larger => the multiplier reacts much
+      more strongly to small accuracy changes around ``center`` (the paper's
+      ``tanh`` is nearly linear, i.e. very gentle, over ``acc in [0, 1]``).
+
+    The paper's gentle default is recovered with roughly
+    ``rho_min=0.5, rho_max=0.881, center~0.5, sharpness~2``.
+    """
+    s = torch.sigmoid(sharpness * (acc - center))
+    return rho_min + (rho_max - rho_min) * s
+
+
+def pref_accuracy_stats(
+    logp_per_sample: torch.Tensor,  # [B] mean per-token policy logp (detached)
+    rewards: torch.Tensor,          # [B]
+    group_index: torch.Tensor,      # [B]
+    num_groups: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-batch pairwise preference accuracy, returned as ``(sum, count)`` over
+    groups so the caller can all-reduce across DDP ranks before averaging.
+
+    For each group, accuracy is the fraction of (chosen, rejected) pairs where
+    ``logp_pi(chosen) > logp_pi(rejected)``.  Groups without both labels are
+    skipped (they carry no preference signal).
+    """
+    total = logp_per_sample.new_zeros(())
+    count = logp_per_sample.new_zeros(())
+    for g in range(num_groups):
+        m = group_index == g
+        if int(m.sum().item()) < 2:
+            continue
+        lp = logp_per_sample[m]
+        rw = rewards[m]
+        chosen = lp[rw >= 0.5]
+        rejected = lp[rw < 0.5]
+        if chosen.numel() == 0 or rejected.numel() == 0:
+            continue
+        wins = (chosen.unsqueeze(1) > rejected.unsqueeze(0)).float().mean()
+        total = total + wins
+        count = count + 1.0
+    return total, count
+
+
 def compute_grpo_loss(
     logp_policy: torch.Tensor,    # [B, T]
     logp_ref: torch.Tensor,       # [B, T]
@@ -1606,6 +1711,12 @@ class GRPOLossWrapper(nn.Module):
         entropy_coeff: float,
         use_duration_control: bool,
         duration_dropout: float,
+        adaptive_kl: bool = False,
+        akl_acc_ema: float = 0.9,
+        akl_rho_min: float = 0.5,
+        akl_rho_max: float = 1.2,
+        akl_center: float = 0.5,
+        akl_sharpness: float = 6.0,
     ):
         super().__init__()
         self.policy_model = policy_model
@@ -1621,6 +1732,15 @@ class GRPOLossWrapper(nn.Module):
         self.use_duration_control = use_duration_control
         self.duration_dropout = duration_dropout
 
+        # Accuracy-Conditioned KL Scaling (AKL).  ``-1`` = EMA not yet seeded.
+        self.adaptive_kl = adaptive_kl
+        self.akl_acc_ema = akl_acc_ema
+        self.akl_rho_min = akl_rho_min
+        self.akl_rho_max = akl_rho_max
+        self.akl_center = akl_center
+        self.akl_sharpness = akl_sharpness
+        self._akl_acc_state = -1.0
+
     def _pin_eval_submodules(self):
         """Force ref_model and fully-frozen policy submodules into eval mode."""
         self.ref_model.eval()
@@ -1635,6 +1755,57 @@ class GRPOLossWrapper(nn.Module):
         super().eval()
         self._pin_eval_submodules()
         return self
+
+    def _effective_kl_coeff(
+        self,
+        logp_pi: torch.Tensor,
+        mask: torch.Tensor,
+        batch: Dict[str, Any],
+    ) -> Tuple[float, Optional[float]]:
+        """Compute the AKL-scaled KL coefficient for the current batch.
+
+        Returns ``(eff_kl_coeff, batch_accuracy)``.  ``batch_accuracy`` is
+        ``None`` when adaptive KL is disabled.  The accuracy is reduced across
+        all DDP ranks so every process applies an identical ``beta_eff``.
+        """
+        if not self.adaptive_kl:
+            return self.kl_coeff, None
+
+        valid_tok = mask.sum(dim=1).clamp_min(1.0)
+        logp_ps = (logp_pi.detach() * mask).sum(dim=1) / valid_tok
+        total, count = pref_accuracy_stats(
+            logp_per_sample=logp_ps,
+            rewards=batch["rewards"],
+            group_index=batch["group_index"],
+            num_groups=int(batch["num_groups"]),
+        )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            packed = torch.stack([total, count])
+            torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+            total, count = packed[0], packed[1]
+
+        acc = (total / count.clamp_min(1.0)).clamp(0.0, 1.0)
+
+        if self.akl_acc_ema > 0.0:
+            acc_val = float(acc.item())
+            if self._akl_acc_state < 0.0:
+                self._akl_acc_state = acc_val
+            else:
+                self._akl_acc_state = (
+                    self.akl_acc_ema * self._akl_acc_state
+                    + (1.0 - self.akl_acc_ema) * acc_val
+                )
+            acc = acc.new_tensor(self._akl_acc_state)
+
+        rho = akl_rho(
+            acc,
+            rho_min=self.akl_rho_min,
+            rho_max=self.akl_rho_max,
+            center=self.akl_center,
+            sharpness=self.akl_sharpness,
+        )
+        return self.kl_coeff * float(rho.item()), float(acc.item())
 
     def forward(self, batch: Dict[str, Any], advantages: torch.Tensor,
                 sample_valid: Optional[torch.Tensor] = None):
@@ -1682,18 +1853,23 @@ class GRPOLossWrapper(nn.Module):
                 return_entropy=False,
             )
 
+        eff_kl_coeff, akl_acc = self._effective_kl_coeff(logp_pi, mask, batch)
+
         loss, metrics = compute_grpo_loss(
             logp_policy=logp_pi,
             logp_ref=logp_ref,
             mask=mask,
             advantages=advantages,
             clip_eps=self.clip_eps,
-            kl_coeff=self.kl_coeff,
+            kl_coeff=eff_kl_coeff,
             kl_estimator=self.kl_estimator,
             entropy=entropy,
             entropy_coeff=self.entropy_coeff,
             sample_valid=sample_valid,
         )
+        if akl_acc is not None:
+            metrics["kl_coeff_eff"] = torch.as_tensor(eff_kl_coeff)
+            metrics["akl_acc"] = torch.as_tensor(akl_acc)
         return loss, metrics
 
 
@@ -1855,6 +2031,12 @@ def main() -> None:
         entropy_coeff=args.entropy_coeff,
         use_duration_control=args.use_duration_control,
         duration_dropout=args.duration_dropout,
+        adaptive_kl=args.adaptive_kl,
+        akl_acc_ema=args.akl_acc_ema,
+        akl_rho_min=args.akl_rho_min,
+        akl_rho_max=args.akl_rho_max,
+        akl_center=args.akl_center,
+        akl_sharpness=args.akl_sharpness,
     )
 
     optimizer = AdamW(
@@ -1998,6 +2180,13 @@ def main() -> None:
                                 {"train/entropy": metrics["entropy"].item()}
                                 if "entropy" in metrics else {}
                             ),
+                            **(
+                                {
+                                    "train/akl_acc": metrics["akl_acc"].item(),
+                                    "train/kl_coeff_eff": metrics["kl_coeff_eff"].item(),
+                                }
+                                if "akl_acc" in metrics else {}
+                            ),
                         },
                         step=global_step,
                     )
@@ -2008,7 +2197,12 @@ def main() -> None:
                         f"kl={metrics['kl'].item():.4f} "
                         f"ratio={metrics['ratio_mean'].item():.4f} "
                         f"n={int(metrics['valid_samples'].item())} "
-                        f"lr={lr:.2e}"
+                        + (
+                            f"acc={metrics['akl_acc'].item():.3f} "
+                            f"beta={metrics['kl_coeff_eff'].item():.4f} "
+                            if "akl_acc" in metrics else ""
+                        )
+                        + f"lr={lr:.2e}"
                     )
                     if ref_cache is not None and accelerator.is_main_process:
                         accelerator.print(f"[RefCache] {ref_cache.stats_str()}")
