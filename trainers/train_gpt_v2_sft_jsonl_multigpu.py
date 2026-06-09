@@ -3,6 +3,8 @@ import argparse
 import json
 import math
 import os
+import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +19,9 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm.auto import tqdm
 from transformers import get_cosine_schedule_with_warmup
+
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(root_dir)
 
 from trainers.train_gpt_v2_grpo_multigpu import (
     EMOTION_ORDER,
@@ -37,7 +42,10 @@ from trainers.train_gpt_v2_grpo_multigpu import (
 class JsonlSFTSample:
     text_ids: torch.Tensor
     wav_16k: torch.Tensor
+    ref_wav_16k: torch.Tensor
     audio_path: str
+    ref_audio_path: str
+    ref_is_self: bool
     emo_control_vector: Optional[torch.Tensor] = None
 
 
@@ -55,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--audio-path-key", type=str, default="audio_path")
     parser.add_argument("--text-key", type=str, default="text")
+    parser.add_argument("--speaker-key", type=str, default="speaker")
     parser.add_argument(
         "--language-filter",
         type=str,
@@ -100,7 +109,13 @@ def parse_args() -> argparse.Namespace:
         "--ref-dropout",
         type=float,
         default=0.1,
-        help="Probability of replacing speaker-reference conditioning with zeros during training.",
+        help="Probability of zeroing speaker-reference conditioning when the ref falls back to target audio.",
+    )
+    parser.add_argument(
+        "--emo-dropout",
+        type=float,
+        default=0.1,
+        help="Probability of replacing the emotion vector with zeros during training.",
     )
     parser.add_argument("--no-emo-vec", action="store_true")
     parser.add_argument(
@@ -121,6 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", type=str, default="IndexTTS2-SFT")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb/accelerate trackers.")
 
     return parser.parse_args()
 
@@ -133,6 +149,7 @@ class JsonlSFTDataset(Dataset):
         tokenizer,
         audio_path_key: str,
         text_key: str,
+        speaker_key: str,
         language_filter: str,
         min_audio_duration: float,
         max_audio_duration: float,
@@ -142,6 +159,7 @@ class JsonlSFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.audio_path_key = audio_path_key
         self.text_key = text_key
+        self.speaker_key = speaker_key
         self.min_audio_duration = min_audio_duration
         self.max_audio_duration = max_audio_duration
         self.max_text_tokens = max_text_tokens
@@ -196,18 +214,70 @@ class JsonlSFTDataset(Dataset):
                 if not audio_path.is_absolute():
                     audio_path = self.audio_root / audio_path
 
+                raw_speaker = item.get(speaker_key)
+                speaker = None
+                if raw_speaker is not None:
+                    speaker = str(raw_speaker).strip() or None
+
                 self.entries.append(
                     {
                         "text": text,
                         "audio_path": str(audio_path),
+                        "speaker": speaker,
                         "emo_control_vector": emo_control_vector,
                     }
                 )
 
+        self.speaker_to_indices: Dict[str, List[int]] = {}
+        for idx, entry in enumerate(self.entries):
+            speaker = entry.get("speaker")
+            if speaker:
+                self.speaker_to_indices.setdefault(speaker, []).append(idx)
+
+        same_speaker_samples = sum(
+            len(indices) for indices in self.speaker_to_indices.values() if len(indices) > 1
+        )
+        multi_speaker_groups = sum(
+            1 for indices in self.speaker_to_indices.values() if len(indices) > 1
+        )
         print(f"[Dataset] Loaded {len(self.entries)} samples. Dropped: {dropped}")
+        print(
+            f"[Dataset] Same-speaker reference candidates: "
+            f"{same_speaker_samples} samples across {multi_speaker_groups} speakers."
+        )
 
     def __len__(self) -> int:
         return len(self.entries)
+
+    def _candidate_ref_indices(self, idx: int) -> List[int]:
+        speaker = self.entries[idx].get("speaker")
+        if not speaker:
+            return []
+        current_audio = self.entries[idx]["audio_path"]
+        return [
+            cand_idx
+            for cand_idx in self.speaker_to_indices.get(speaker, [])
+            if cand_idx != idx and self.entries[cand_idx]["audio_path"] != current_audio
+        ]
+
+    def _load_reference_wav(self, idx: int, target_wav: torch.Tensor) -> tuple[torch.Tensor, str, bool]:
+        candidates = self._candidate_ref_indices(idx)
+        if candidates:
+            random.shuffle(candidates)
+            for cand_idx in candidates[:8]:
+                ref_path = self.entries[cand_idx]["audio_path"]
+                ref_wav = _read_audio_to_16k(
+                    ref_path,
+                    max_seconds=self.max_audio_duration,
+                    truncate=False,
+                )
+                if ref_wav is None:
+                    continue
+                if ref_wav.numel() < int(self.min_audio_duration * TARGET_SR):
+                    continue
+                return ref_wav, ref_path, False
+
+        return target_wav, self.entries[idx]["audio_path"], True
 
     def __getitem__(self, idx: int) -> Optional[JsonlSFTSample]:
         entry = self.entries[idx]
@@ -227,11 +297,15 @@ class JsonlSFTDataset(Dataset):
         )
         if wav is None or wav.numel() < int(self.min_audio_duration * TARGET_SR):
             return None
+        ref_wav, ref_audio_path, ref_is_self = self._load_reference_wav(idx, wav)
 
         return JsonlSFTSample(
             text_ids=torch.tensor(text_ids, dtype=torch.long),
             wav_16k=wav,
+            ref_wav_16k=ref_wav,
             audio_path=entry["audio_path"],
+            ref_audio_path=ref_audio_path,
+            ref_is_self=ref_is_self,
             emo_control_vector=entry["emo_control_vector"],
         )
 
@@ -246,25 +320,37 @@ def prepare_sft_batch(
     policy_model,
     device: torch.device,
     ref_dropout: float = 0.0,
+    emo_dropout: float = 0.0,
 ) -> Optional[Dict[str, torch.Tensor]]:
     if not samples:
         return None
 
-    wavs = [s.wav_16k for s in samples]
+    target_wavs = [s.wav_16k for s in samples]
+    ref_wavs = [s.ref_wav_16k for s in samples]
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
-        spk_cond_emb, code_lengths = feature_extractor.extract_spk_cond_emb(wavs)
-        feat_t = spk_cond_emb.transpose(1, 2)
-        conditioning = policy_model.get_conditioning(feat_t, code_lengths)
-        emo_vec = policy_model.get_emovec(spk_cond_emb, code_lengths)
-        codes, _ = feature_extractor.semantic_codec.quantize(spk_cond_emb.float())
+        ref_spk_cond_emb, ref_lengths = feature_extractor.extract_spk_cond_emb(ref_wavs)
+        ref_feat_t = ref_spk_cond_emb.transpose(1, 2)
+        conditioning = policy_model.get_conditioning(ref_feat_t, ref_lengths)
+        emo_vec = policy_model.get_emovec(ref_spk_cond_emb, ref_lengths)
+
+        target_spk_cond_emb, code_lengths = feature_extractor.extract_spk_cond_emb(target_wavs)
+        codes, _ = feature_extractor.semantic_codec.quantize(target_spk_cond_emb.float())
         codes = codes.long()
 
-        drop_mask = None
+        ref_drop_mask = None
         if ref_dropout > 0.0:
-            drop_mask = torch.rand(conditioning.size(0), device=device) < ref_dropout
-            if drop_mask.any():
+            self_ref_mask = torch.tensor(
+                [s.ref_is_self for s in samples],
+                dtype=torch.bool,
+                device=device,
+            )
+            ref_drop_mask = (
+                self_ref_mask
+                & (torch.rand(conditioning.size(0), device=device) < ref_dropout)
+            )
+            if ref_drop_mask.any():
                 conditioning = torch.where(
-                    drop_mask.view(-1, 1, 1),
+                    ref_drop_mask.view(-1, 1, 1),
                     torch.zeros_like(conditioning),
                     conditioning,
                 )
@@ -278,17 +364,19 @@ def prepare_sft_batch(
                     for s in samples
                 ]
             ).to(device=device, dtype=torch.float32)
-            styles = feature_extractor.extract_styles(wavs)
+            styles = feature_extractor.extract_styles(ref_wavs)
             label_emovec = feature_extractor.build_label_emovec(styles, controls)
             residual_scale = 1.0 - controls.sum(dim=1, keepdim=True)
             emo_vec = label_emovec + residual_scale * emo_vec
 
-        if drop_mask is not None and drop_mask.any():
-            emo_vec = torch.where(
-                drop_mask.view(-1, 1),
-                torch.zeros_like(emo_vec),
-                emo_vec,
-            )
+        if emo_dropout > 0.0:
+            emo_drop_mask = torch.rand(emo_vec.size(0), device=device) < emo_dropout
+            if emo_drop_mask.any():
+                emo_vec = torch.where(
+                    emo_drop_mask.view(-1, 1),
+                    torch.zeros_like(emo_vec),
+                    emo_vec,
+                )
 
     text_ids = pad_sequence(
         [s.text_ids for s in samples],
@@ -401,11 +489,11 @@ def main() -> None:
     args = parse_args()
     accelerator = Accelerator(
         gradient_accumulation_steps=args.grad_accumulation,
-        log_with="wandb",
+        log_with=None if args.no_wandb else "wandb",
     )
     set_seed(args.seed)
 
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and not args.no_wandb:
         accelerator.init_trackers(
             project_name=args.wandb_project,
             config=serializable_config(args),
@@ -454,6 +542,7 @@ def main() -> None:
         tokenizer=tokenizer,
         audio_path_key=args.audio_path_key,
         text_key=args.text_key,
+        speaker_key=args.speaker_key,
         language_filter=args.language_filter,
         min_audio_duration=args.min_audio_duration,
         max_audio_duration=args.max_audio_duration,
@@ -551,6 +640,7 @@ def main() -> None:
                 policy_for_prep,
                 accelerator.device,
                 ref_dropout=args.ref_dropout,
+                emo_dropout=args.emo_dropout,
             )
             if batch is None:
                 continue
