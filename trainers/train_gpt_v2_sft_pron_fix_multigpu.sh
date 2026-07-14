@@ -19,8 +19,8 @@ uv run --with 'wandb>=0.17' accelerate launch \
     --batch-size-per-device 2 \
     --grad-accumulation 1 \
     --num-workers 2 \
-    --epochs 3 \
-    --learning-rate 1e-5 \
+    --epochs 50 \
+    --learning-rate 4e-5 \
     --weight-decay 0.01 \
     --warmup-steps 50 \
     --ref-dropout 0.1 \
@@ -33,6 +33,6 @@ uv run --with 'wandb>=0.17' accelerate launch \
     --output-dir ./trained_ckpts/sft_pron_fix \
     --resume auto \
     --wandb-project "IndexTTS2-SFT" \
-    --wandb-run-name "pron_fix_sft_260609"
+    --wandb-run-name "pron_fix_sft_260701"
     # --use-duration-control --duration-dropout 0.3 \
     # --no-emo-vec \

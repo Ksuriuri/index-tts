@@ -465,9 +465,9 @@ def evaluate(
             mel_loss, metrics = model(batch)
         count = metrics["tokens"].detach()
         stats = torch.stack([mel_loss.detach() * count, count])
-        gathered = accelerator.gather(stats)
-        total_loss += gathered[0::2].sum().item()
-        total_count += gathered[1::2].sum().item()
+        gathered = accelerator.gather(stats).reshape(-1, 2)
+        total_loss += gathered[:, 0].sum().item()
+        total_count += gathered[:, 1].sum().item()
 
     model.train()
     return {"mel_loss": total_loss / max(total_count, 1.0)}
@@ -662,10 +662,18 @@ def main() -> None:
 
                 if global_step % args.log_interval == 0:
                     lr = scheduler.get_last_lr()[0]
+                    train_count = metrics["tokens"].detach()
+                    train_stats = torch.stack([mel_loss.detach() * train_count, train_count])
+                    gathered_train = accelerator.gather(train_stats).reshape(-1, 2)
+                    train_loss_global = (
+                        gathered_train[:, 0].sum() / gathered_train[:, 1].sum().clamp_min(1.0)
+                    )
+                    train_tokens_global = gathered_train[:, 1].sum()
                     accelerator.log(
                         {
-                            "train/mel_loss": mel_loss.item(),
-                            "train/tokens": metrics["tokens"].item(),
+                            "train/mel_loss": train_loss_global.item(),
+                            "train/local_mel_loss": mel_loss.item(),
+                            "train/tokens": train_tokens_global.item(),
                             "train/lr": lr,
                             "train/epoch": epoch + logical_batch_idx / max(len(train_loader), 1),
                         },
@@ -673,7 +681,8 @@ def main() -> None:
                     )
                     accelerator.print(
                         f"[Train] epoch={epoch + 1} step={global_step} "
-                        f"loss={mel_loss.item():.4f} lr={lr:.2e}"
+                        f"loss={train_loss_global.item():.4f} "
+                        f"local_loss={mel_loss.item():.4f} lr={lr:.2e}"
                     )
 
                 if (
@@ -717,9 +726,9 @@ def main() -> None:
             break
 
     accelerator.wait_for_everyone()
+    save_path = output_dir / "checkpoint-final"
+    accelerator.save_state(save_path)
     if accelerator.is_main_process:
-        save_path = output_dir / "checkpoint-final"
-        accelerator.save_state(save_path)
         unwrapped = accelerator.unwrap_model(model)
         torch.save({"model": unwrapped.model.state_dict()}, output_dir / "model_final.pth")
 

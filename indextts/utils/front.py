@@ -95,10 +95,6 @@ class TextNormalizer:
     例如：克里斯托弗·诺兰，约瑟夫·高登-莱维特
     """
 
-    # 匹配常见英语缩写 's，仅用于替换为 is，不匹配所有 's
-    ENGLISH_CONTRACTION_PATTERN = r"(what|where|who|which|how|t?here|it|s?he|that|this)'s"
-
-
     def use_chinese(self, s):
         has_chinese = bool(re.search(r"[\u4e00-\u9fff]", s))
         has_alpha = bool(re.search(r"[a-zA-Z]", s))
@@ -199,15 +195,12 @@ class TextNormalizer:
         self._ensure_normalizers()
 
         if lang == "ja":
-            text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             return self.normalize_japanese(text)
         
         if lang == "es":
-            text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             return self.normalize_spanish(text)
             
         if lang == "zh":
-            text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
             replaced_text, pinyin_list = self.save_pinyin_tones(text.rstrip())
 
             replaced_text, original_name_list = self.save_names(replaced_text)
@@ -223,7 +216,6 @@ class TextNormalizer:
 
         if lang == "en":
             try:
-                text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
                 result = self.en_normalizer.normalize(text)
             except Exception:
                 result = text
